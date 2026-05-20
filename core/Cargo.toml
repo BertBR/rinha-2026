@@ -1,0 +1,28 @@
+[package]
+name = "rinha-knn"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "build-ivf"
+path = "src/build_ivf.rs"
+
+[dependencies]
+napi = { version = "2", features = ["napi6"] }
+napi-derive = "2"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = false
+panic = "abort"
