@@ -1,35 +1,44 @@
 // VP-tree over int16-quantized 14-dim vectors. Exact k-NN with tie-break on
 // original index, matching the grader's brute-force ordering.
 //
-// Storage layout (typed arrays, no objects):
-//   pointIdx[node]    : Uint32  original index into vectors array
-//   threshold[node]   : Float32 actual Euclidean distance (not squared) to the
-//                                median of vp's distances to siblings
-//   leftOffset[node]  : Int32   node index of left subtree root, -1 if none
-//   rightOffset[node] : Int32   node index of right subtree root, -1 if none
+// Storage layout (in-memory + on-disk, struct-of-arrays for cache locality):
+//   threshold[node] : Float32 actual Euclidean distance to the median of vp's
+//                              distances to siblings  (4 * N bytes)
+//   packed[node*9 .. node*9+9] : 9 bytes per node, three 24-bit fields:
+//     bytes 0..2  : pointIdx (uint24, max 16M, fits 3M+)
+//     bytes 3..5  : leftOffset (int24, 0xFFFFFF = -1 = no child)
+//     bytes 6..8  : rightOffset (int24, same encoding)
 //
-// 16 bytes per node. 3M nodes → 48 MB. Kept simple (no bit-packing) because
-// the access pattern is mostly cache-line-fetched and a packed format would
-// trade saving 15 MB for several extra ALU ops per node visit.
+// 13 bytes per node total (vs 16 in the original). At 3M nodes that saves
+// 9 MB, which is critical for fitting int16 vectors + V8 baseline into the
+// 165 MB per-container budget.
 
 import { DIMS, distanceSqInt16 } from './quantize.ts';
 import { TopKHeap } from './heap.ts';
 
+const NULL_OFFSET = 0xffffff;
+
 export interface VpTree {
-  pointIdx: Uint32Array;
-  threshold: Float32Array;
-  leftOffset: Int32Array;
-  rightOffset: Int32Array;
+  threshold: Float32Array;     // size N
+  packed: Uint8Array;          // size N * 9
   size: number;
 }
 
 const STACK_DEPTH = 128;
 
+function readUint24(buf: Uint8Array, offset: number): number {
+  return buf[offset] | (buf[offset + 1] << 8) | (buf[offset + 2] << 16);
+}
+
+function writeUint24(buf: Uint8Array, offset: number, value: number): void {
+  buf[offset] = value & 0xff;
+  buf[offset + 1] = (value >> 8) & 0xff;
+  buf[offset + 2] = (value >> 16) & 0xff;
+}
+
 export function buildVpTree(vectors: Int16Array, N: number): VpTree {
-  const pointIdx = new Uint32Array(N);
   const threshold = new Float32Array(N);
-  const leftOffset = new Int32Array(N);
-  const rightOffset = new Int32Array(N);
+  const packed = new Uint8Array(N * 9);
 
   const indices = new Uint32Array(N);
   for (let i = 0; i < N; i++) indices[i] = i;
@@ -48,28 +57,30 @@ export function buildVpTree(vectors: Int16Array, N: number): VpTree {
 
     if (start >= end) {
       if (parentNode >= 0) {
-        if (side === 1) leftOffset[parentNode] = -1;
-        else rightOffset[parentNode] = -1;
+        const fieldOffset = parentNode * 9 + (side === 1 ? 3 : 6);
+        writeUint24(packed, fieldOffset, NULL_OFFSET);
       }
       continue;
     }
 
     const nodeIdx = nodeCount++;
     if (parentNode >= 0) {
-      if (side === 1) leftOffset[parentNode] = nodeIdx;
-      else rightOffset[parentNode] = nodeIdx;
+      const fieldOffset = parentNode * 9 + (side === 1 ? 3 : 6);
+      writeUint24(packed, fieldOffset, nodeIdx);
     }
 
+    const base = nodeIdx * 9;
+
     if (end - start === 1) {
-      pointIdx[nodeIdx] = indices[start];
+      writeUint24(packed, base, indices[start]);
+      writeUint24(packed, base + 3, NULL_OFFSET);
+      writeUint24(packed, base + 6, NULL_OFFSET);
       threshold[nodeIdx] = 0;
-      leftOffset[nodeIdx] = -1;
-      rightOffset[nodeIdx] = -1;
       continue;
     }
 
     const vpOrigIdx = indices[start];
-    pointIdx[nodeIdx] = vpOrigIdx;
+    writeUint24(packed, base, vpOrigIdx);
     const vpOffset = vpOrigIdx * DIMS;
 
     for (let i = start + 1; i < end; i++) {
@@ -96,10 +107,8 @@ export function buildVpTree(vectors: Int16Array, N: number): VpTree {
   }
 
   return {
-    pointIdx: pointIdx.slice(0, nodeCount),
     threshold: threshold.slice(0, nodeCount),
-    leftOffset: leftOffset.slice(0, nodeCount),
-    rightOffset: rightOffset.slice(0, nodeCount),
+    packed: packed.slice(0, nodeCount * 9),
     size: nodeCount,
   };
 }
@@ -166,23 +175,23 @@ export function searchVpTree(
   let stackTop = 0;
   stack[stackTop++] = 0;
 
-  const pointIdx = tree.pointIdx;
+  const packed = tree.packed;
   const thresholds = tree.threshold;
-  const leftOff = tree.leftOffset;
-  const rightOff = tree.rightOffset;
 
   while (stackTop > 0) {
     const nodeIdx = stack[--stackTop];
+    const base = nodeIdx * 9;
 
-    const vpPtIdx = pointIdx[nodeIdx];
+    // Inline uint24 read for pointIdx (hot path).
+    const vpPtIdx = packed[base] | (packed[base + 1] << 8) | (packed[base + 2] << 16);
     const vpOffset = vpPtIdx * DIMS;
     const dSq = distanceSqInt16(query, vectors, vpOffset);
 
     heap.tryInsert(dSq, vpPtIdx);
 
-    const left = leftOff[nodeIdx];
-    const right = rightOff[nodeIdx];
-    if (left < 0 && right < 0) continue;
+    const left = packed[base + 3] | (packed[base + 4] << 8) | (packed[base + 5] << 16);
+    const right = packed[base + 6] | (packed[base + 7] << 8) | (packed[base + 8] << 16);
+    if (left === NULL_OFFSET && right === NULL_OFFSET) continue;
 
     const tau = thresholds[nodeIdx];
     const d = Math.sqrt(dSq);
@@ -200,56 +209,56 @@ export function searchVpTree(
       far = left;
     }
 
-    if (far >= 0 && gapSq < tauSq) {
+    if (far !== NULL_OFFSET && gapSq < tauSq) {
       stack[stackTop++] = far;
     }
-    if (near >= 0) {
+    if (near !== NULL_OFFSET) {
       stack[stackTop++] = near;
     }
   }
 }
 
-// Serialize to a single Buffer. Header: 16 bytes
-//   uint32 magic = 0x56505432  ("VPT2", bumped from VPT1 for int16 format)
+// Serialize to one Buffer. Header: 16 bytes
+//   uint32 magic = 0x56505433  ("VPT3", compact 13-bytes/node format)
 //   uint32 size
 //   uint32 reserved
 //   uint32 reserved
-// Then four parallel arrays of size * 4 bytes:
-//   pointIdx (uint32), threshold (float32), leftOffset (int32), rightOffset (int32)
+// Then:
+//   threshold (Float32 * N) — 4*N bytes
+//   packed    (Uint8  * 9*N) — 9*N bytes
 export function serializeVpTree(tree: VpTree): Buffer {
   const N = tree.size;
-  const bufSize = 16 + N * 16;
+  const bufSize = 16 + 4 * N + 9 * N;
   const buf = Buffer.alloc(bufSize);
-  buf.writeUInt32LE(0x56505432, 0);
+  buf.writeUInt32LE(0x56505433, 0);
   buf.writeUInt32LE(N, 4);
 
-  const u32 = new Uint32Array(buf.buffer, buf.byteOffset + 16, N);
-  u32.set(tree.pointIdx);
-
-  const f32 = new Float32Array(buf.buffer, buf.byteOffset + 16 + N * 4, N);
+  const f32 = new Float32Array(buf.buffer, buf.byteOffset + 16, N);
   f32.set(tree.threshold);
 
-  const i32a = new Int32Array(buf.buffer, buf.byteOffset + 16 + N * 8, N);
-  i32a.set(tree.leftOffset);
-
-  const i32b = new Int32Array(buf.buffer, buf.byteOffset + 16 + N * 12, N);
-  i32b.set(tree.rightOffset);
+  // Copy packed bytes (Buffer-aligned, no alignment constraint for Uint8)
+  buf.set(tree.packed, 16 + 4 * N);
 
   return buf;
 }
 
 export function deserializeVpTree(buf: Buffer): VpTree {
   const magic = buf.readUInt32LE(0);
-  if (magic !== 0x56505432) {
-    throw new Error(`bad vptree magic: 0x${magic.toString(16)} (expected VPT2)`);
+  if (magic !== 0x56505433) {
+    throw new Error(`bad vptree magic: 0x${magic.toString(16)} (expected VPT3)`);
   }
   const N = buf.readUInt32LE(4);
   const base = buf.byteOffset + 16;
+  const thresholdView = new Float32Array(buf.buffer, base, N);
+  // The packed array follows; it has no alignment constraint, but using a
+  // Uint8Array view backed by the same Buffer keeps it zero-copy.
+  const packedView = new Uint8Array(buf.buffer, base + 4 * N, 9 * N);
   return {
-    pointIdx: new Uint32Array(buf.buffer, base, N),
-    threshold: new Float32Array(buf.buffer, base + N * 4, N),
-    leftOffset: new Int32Array(buf.buffer, base + N * 8, N),
-    rightOffset: new Int32Array(buf.buffer, base + N * 12, N),
+    threshold: thresholdView,
+    packed: packedView,
     size: N,
   };
 }
+
+// Backward-compatible compat layer for callers that referenced the old shape.
+export const NULL_NODE = NULL_OFFSET;
