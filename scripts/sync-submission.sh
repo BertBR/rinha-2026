@@ -50,6 +50,11 @@ cp "$REPO_ROOT/src/"*.ts          "$WORKTREE/src/"
 MAIN_SHA=$(cd "$REPO_ROOT" && git rev-parse --short HEAD)
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+# Image tag rewriting hook: if the docker-compose.yml in main references an
+# image like `ghcr.io/bertbr/rinha-2026-api:int16-<oldsha>`, we leave it as
+# is — the build/push step is responsible for tagging with the SHA already
+# present in main. The grader needs the exact tag we pushed.
+
 cd "$WORKTREE"
 git add -A
 if git diff --cached --quiet; then

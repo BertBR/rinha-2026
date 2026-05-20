@@ -1,7 +1,8 @@
 name: rinha-2026
 
 x-api: &api-template
-  image: ghcr.io/bertbr/rinha-2026-api:latest
+  image: ghcr.io/bertbr/rinha-2026-api:int16-84ec2e7
+  pull_policy: always
   restart: unless-stopped
   volumes:
     - sockets:/sockets
