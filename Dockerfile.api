@@ -33,10 +33,11 @@ RUN node --experimental-strip-types --max-old-space-size=4096 src/build-index.ts
 FROM node:22-bookworm-slim AS runtime
 WORKDIR /app
 
-ENV NODE_OPTIONS="--max-old-space-size=48 --max-semi-space-size=2"
+ENV NODE_OPTIONS="--max-old-space-size=24 --max-semi-space-size=2"
 ENV DATA_DIR=/app/data
 ENV UDS_PATH=/sockets/api.sock
 ENV WARMUP_QUERIES=3000
+ENV NODE_NO_WARNINGS=1
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund

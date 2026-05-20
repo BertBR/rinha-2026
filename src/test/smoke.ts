@@ -23,7 +23,7 @@ function quantizeFloats(arr: number[]): number[] {
   return arr.map((v) => {
     if (v === -1) return SENTINEL;
     const q = Math.round(v * QUANT_SCALE);
-    return q < 0 ? 0 : q > 127 ? 127 : q;
+    return q < 0 ? 0 : q > 32767 ? 32767 : q;
   });
 }
 
@@ -44,7 +44,7 @@ async function main(): Promise<void> {
   console.log(`[smoke] refs=${refs.length} payloads=${payloads.length}`);
 
   const N = refs.length;
-  const vectors = new Int8Array(N * DIMS);
+  const vectors = new Int16Array(N * DIMS);
   const labels = new Uint8Array(Math.ceil(N / 8));
 
   for (let i = 0; i < N; i++) {
@@ -66,7 +66,7 @@ async function main(): Promise<void> {
   assertEq(tree2.size, tree.size, 'serialize round-trip size');
 
   const queryFloat = new Float32Array(DIMS);
-  const queryInt8 = new Int8Array(DIMS);
+  const queryInt8 = new Int16Array(DIMS);
   const heap = new TopKHeap(5);
 
   let queriesRun = 0;
@@ -96,8 +96,8 @@ async function main(): Promise<void> {
 }
 
 function bruteForceTop5(
-  vectors: Int8Array,
-  query: Int8Array,
+  vectors: Int16Array,
+  query: Int16Array,
   N: number,
 ): Array<{ d: number; i: number }> {
   const all: Array<{ d: number; i: number }> = new Array(N);
