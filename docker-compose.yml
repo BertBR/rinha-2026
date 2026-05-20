@@ -17,11 +17,10 @@ services:
     container_name: rinha-api1
     environment:
       UDS_PATH: /sockets/api1.sock
-      WARMUP_QUERIES: 3000
     deploy:
       resources:
         limits:
-          cpus: "0.40"
+          cpus: "0.42"
           memory: "160MB"
 
   api2:
@@ -29,29 +28,32 @@ services:
     container_name: rinha-api2
     environment:
       UDS_PATH: /sockets/api2.sock
-      WARMUP_QUERIES: 3000
     deploy:
       resources:
         limits:
-          cpus: "0.40"
+          cpus: "0.42"
           memory: "160MB"
 
   lb:
-    image: haproxy:3.0-alpine
+    image: ghcr.io/bertbr/rinha-2026-lb:r1
+    pull_policy: always
     container_name: rinha-lb
     restart: unless-stopped
     depends_on:
       - api1
       - api2
+    environment:
+      PORT: "9999"
+      UPSTREAMS: /sockets/api1.sock,/sockets/api2.sock
+      WORKERS: "2"
     volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - sockets:/sockets
     ports:
       - "9999:9999"
     deploy:
       resources:
         limits:
-          cpus: "0.20"
+          cpus: "0.16"
           memory: "30MB"
     ulimits:
       nofile:

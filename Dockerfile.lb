@@ -1,3 +1,14 @@
 # syntax=docker/dockerfile:1.7
-FROM haproxy:3.0-alpine
-COPY haproxy.cfg /usr/local/etc/haproxy/haproxy.cfg
+
+FROM rust:1-slim-bookworm AS lb-builder
+WORKDIR /build
+COPY core-lb/Cargo.toml ./Cargo.toml
+COPY core-lb/src ./src
+RUN cargo build --release --bin rinha-lb
+
+FROM debian:bookworm-slim
+COPY --from=lb-builder /build/target/release/rinha-lb /usr/local/bin/rinha-lb
+ENV PORT=9999
+ENV UPSTREAMS=/sockets/api1.sock,/sockets/api2.sock
+ENV WORKERS=2
+ENTRYPOINT ["/usr/local/bin/rinha-lb"]
