@@ -22,7 +22,7 @@ import {
 
 const DATA_DIR = process.env.DATA_DIR ?? './data';
 const UDS_PATH = process.env.UDS_PATH ?? '/sockets/api.sock';
-const WARMUP_QUERIES = Number(process.env.WARMUP_QUERIES ?? 10_000);
+const WARMUP_QUERIES = Number(process.env.WARMUP_QUERIES ?? 3_000);
 
 interface LoadedIndex {
   vectors: Int8Array;
