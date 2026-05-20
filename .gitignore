@@ -1,0 +1,24 @@
+data/*
+!data/.gitkeep
+
+# Go
+go/bin/
+go/dist/
+*.test
+*.out
+
+# Node
+node/node_modules/
+node/dist/
+node/.npm/
+
+# Build artifacts
+*.index
+*.bin
+*.idx
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+*.swp
