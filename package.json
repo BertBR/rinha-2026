@@ -1,0 +1,20 @@
+{
+  "name": "rinha-2026-node",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build-index": "node --experimental-strip-types --max-old-space-size=4096 src/build-index.ts",
+    "start": "node --experimental-strip-types src/api.ts",
+    "test": "node --experimental-strip-types src/test/smoke.ts"
+  },
+  "dependencies": {
+    "stream-json": "^1.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}

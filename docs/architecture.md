@@ -1,110 +1,191 @@
-# Architecture — locked decisions
+# Architecture — locked decisions (rev 2)
 
-> Planning notes, not marketing. If you disagree with a decision, push back with a benchmark.
+> Rev 2 reflects competitive intel from Rinha 2025/2024/2026 submissions. See `docs/competitive-intel.md` for sources.
 
 ## Goal
 
-First place in the **Node.js** stack at Rinha de Backend 2026.
-A Go port is a stretch goal, attempted only if the Node submission is locked at the top of its stack by D10. Pódium geral is not the target — anyone writing hand-rolled C++ with SIMD intrinsics will be ahead and that is fine.
+First place in the **Node.js** stack at Rinha de Backend 2026. Top-10 overall is a realistic stretch. Anyone running io_uring + AVX2 in Rust will be ahead and that is fine.
 
-**Why Node-first** (full reasoning in `docs/stack-choice.md`): primary daily stack, less competitive field, hnswlib-node native binding lifts the heavy compute out of V8, blog post defendable in interviews, tighter thematic fit with target pipeline (Speechify Platform, Clara AI, LemFi, Anthropic Skills).
+## What is being built
 
-## Constraints (recap)
+A fraud detection HTTP API that returns the k=5 nearest-neighbor decision from 3,000,000 labeled 14-dimensional vectors under 1 CPU and 350 MB total memory, p99 ≤ 2-3 ms.
 
-- 1.0 vCPU, 350 MB RAM total across LB + 2 API instances.
-- Mac Mini Late 2014, Intel Haswell, 2.6 GHz (AVX2 available; cgroup-limited).
-- Port 9999. Bridge network. `linux-amd64`. Docker compose with public images.
-- 3M reference vectors, 14 dimensions. Exact brute-force k-NN (k=5, Euclidean) is the ground truth.
-- p99 ≤ 1 ms saturates at +3000. 10× improvement = +1000.
-- 15% failure rate cutoff (FP + FN + Err). HTTP 500 weight 5×, FN 3×, FP 1×.
+## Algorithm
 
-## Decisions
+**VP-tree with int8-quantized vectors and tie-break on original ID.**
 
-| # | Decision | Why |
-|---|----------|-----|
-| 1 | **HNSW + exact rerank** | Brute force on 3M × 14 with cache misses lands at 5-10 ms. HNSW with ef=50 lands at 50-200 µs. Rerank top-20 with exact int8 SIMD distance to stay ≥99.5% recall vs the brute-force labels. |
-| 2 | **int8 quantization** | Map `[-1, 1]` → `[-128, 127]` (scale 127, zero 0). The `-1` sentinel preserves its meaning naturally. 14 bytes/vec × 3M = **42 MB raw**. Distance computed as int16 squared accumulator (no overflow for 14 dims). |
-| 3 | **Build index at Docker build time, mmap at runtime** | Reference file is immutable. Pay the build cost once. Ship a binary index file. Both API instances mmap the same file: Linux page cache de-dupes, so we pay the RAM cost once for both. |
-| 4 | **fasthttp (Go) / uWebSockets.js (Node)** | net/http and Node's http have ~50-100 µs per request overhead. At our target p99 budget that is 5-10% of the latency budget on syscalls alone. Both alternatives are battle-tested at sub-ms ranges. |
-| 5 | **Custom Go LB binary** | nginx ≈ 25 MB resident, HAProxy ≈ 15 MB. A 100-line Go round-robin reverse proxy ships in ~6 MB scratch image, ~10 MB resident. The LB only forwards; we do not need nginx semantics. |
-| 6 | **Pre-baked response strings** | fraud_score is one of 6 values: 0.0, 0.2, 0.4, 0.6, 0.8, 1.0. Pre-allocate the 6 JSON response byte slices at startup. Zero allocation per request on the happy path. |
-| 7 | **Hand-rolled JSON for the request** | The payload schema is fixed. A schema-driven parser (jsoniter API or hand-written tokenizer) avoids reflection. Worth ~2-5 µs per request vs `sonic`/`encoding/json`. Node side: V8 JSON.parse is already heavily optimized; we use it directly. |
-| 8 | **GOMAXPROCS=1 per API instance, 2 instances** | With 0.45 CPU per instance, Go runtime stealing across multiple Ps is wasted. Pin GOMAXPROCS=1 to remove scheduler overhead. Node is single-threaded already. |
-| 9 | **HTTP 500 is forbidden** | Weight 5× + counts toward 15% failure cutoff. Any internal error (timeout, panic, index miss) returns `{"approved": true, "fraud_score": 0.0}` instead. Sacrifice 1×-3× per failed request to avoid the 5× error penalty. |
-| 10 | **No database, no message broker, no Redis** | Read-only workload over immutable reference data. Anything beyond the binary index + HTTP server is dead weight in this budget. |
+- HNSW is rejected: M=16 index over 3M × 14 needs ~250 MB, blows budget.
+- Brute force with early termination is rejected: ~20 ms p99, two orders too slow.
+- IVF is rejected: needs k-means precomputation + bbox repair for exact top-5. More moving parts for the same result.
+- VP-tree is exact, low-dimensional friendly (14 dims is well within VP's sweet spot), O(log N · k) expected queries, no recall risk.
+
+**Tie-break rule:** when two candidate distances are equal, the one with smaller original ID wins. The grader uses brute force with stable order, so we must match this to avoid spurious FP/FN.
+
+## Quantization
+
+`float32 [-1, 1]` → `int8 [-128, 127]`:
+- Non-sentinel values in `[0, 1]`: `int8 = round(v * 127)`, range `[0, 127]`.
+- Sentinel `-1` (missing data at indices 5 and 6): `int8 = -128`.
+- Distance is computed as `int32 sum of (a-b)²`, no float in the hot path.
+- The sentinel value of -128 is far enough from valid range that missing-pairs cluster naturally, same as the float -1 semantics.
+
+Memory footprint:
+- Vectors: 3,000,000 × 14 = **42 MB**
+- Labels (1 bit each, packed): **375 KB**
+- VP-tree nodes (16 bytes each): **48 MB**
+- Total cold data per instance: **~90 MB**
+
+## HTTP stack
+
+**Raw `node:http`.** Zero dependencies for the server, smallest possible image, matches the reference 2026 Node submission. uWebSockets.js was considered (~50-100 µs faster per request) but adds a native binding and the marginal gain is below the GC noise floor at p99.
+
+- HTTP/1.1 with `Connection: keep-alive` forever
+- Listen on a Unix domain socket, not TCP — saves 100-300 µs per LB hop
+- 6 pre-baked response Buffers (one per fraud_score value: 0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+- Hand-rolled JSON tokenizer for the payload (no `JSON.parse`)
+- Zero allocations on the hot path: pre-allocated query Int8Array(14), pre-allocated heap
+
+## Load balancer
+
+**HAProxy 3.x in `mode tcp`** with `nbthread 2`, UDS upstreams:
+
+```
+backend api
+    server api1 unix@/sockets/api1.sock check
+    server api2 unix@/sockets/api2.sock check
+    balance roundrobin
+```
+
+Rejected:
+- nginx: 100-300 µs slower per hop, larger image.
+- Custom Go LB: HAProxy is battle-tested for this exact pattern and ships in ~5 MB resident in slim image.
+
+## Process model
+
+**No clustering, no worker_threads.** Two single-process Node containers each pinned to ~0.40 CPU. The k6 traffic ramps to 900 req/s, distributed across two instances = 450 req/s per instance, well below what one Node event loop handles. Multi-worker experiments by 2025 Node top-10 contestants explicitly degraded p99.
 
 ## Memory budget
 
-| Component | Target | Notes |
-|-----------|--------|-------|
-| LB (Go scratch) | 10 MB | Single binary, fasthttp reverse proxy, round-robin |
-| API instance × 2 | 80 MB each = 160 MB | Go runtime + fasthttp pools + working set. Page cache of mmap'd index is shared. |
-| Index file (mmap, shared) | 70 MB | int8 vectors (42 MB) + HNSW graph (~25 MB at M=16) + labels bitmap (3 MB) |
-| Headroom | 110 MB | Linux page cache for the index, network buffers, kernel slab |
+| Component | Target | Realized |
+|-----------|--------|----------|
+| HAProxy | 25 MB | |
+| API instance × 2 | 130 MB each = 260 MB | |
+| ↳ V8 RSS baseline | ~35 MB | |
+| ↳ Vectors + labels + VP-tree | ~90 MB | |
+| ↳ HTTP buffers + heap headroom | ~5 MB | |
+| Slack | 65 MB | |
 | **Total** | **350 MB** | |
 
-For Node: API instance baseline jumps to ~110 MB each (V8 heap + uWS native). Total ~290 MB before headroom. **Tighter.** First validation milestone for Node is "does it fit at all."
+V8 flags: `--max-old-space-size=96 --max-semi-space-size=4 --optimize-for-size`.
 
 ## CPU budget
 
-- LB: 0.05 (forwarding only)
-- API × 2: 0.45 each = 0.90
-- Slack: 0.05
+- HAProxy: 0.20 CPU
+- API × 2: 0.40 CPU each = 0.80
+- Total: 1.00
 
-GOMAXPROCS=1 inside the container. We are not parallelizing kNN inside a single request; a single ef=50 HNSW search is short enough that goroutine overhead would dominate.
+## Build-time precomputation
 
-## Per-stack specifics
+Multi-stage Dockerfile:
+1. Download `references.json.gz`, `mcc_risk.json`, `normalization.json` from upstream.
+2. Gunzip + parse 3,000,000 reference vectors.
+3. Quantize to int8.
+4. Build VP-tree.
+5. Emit three binary files: `vectors.bin` (42 MB), `labels.bin` (375 KB), `vptree.bin` (48 MB).
+6. Copy binaries into the runtime image. Source data is discarded.
 
-### Go
+Runtime: `fs.readFile` each file once at process start into typed array buffers. No deserialization, no parsing — the buffer view IS the data structure.
 
-- **HNSW lib**: start with `github.com/coder/hnsw`. If recall/perf is short of target after week 1, swap for an int8-native implementation (probably hand-rolled, ~400 LOC).
-- **SIMD**: explore `gonum/floats` first. If we need more, write a small AVX2 assembly stub for `int16` squared-sum over 14 lanes. Go's `cmd/asm` supports this. Last resort: cgo to `usearch`.
-- **JSON**: hand-written tokenizer over the fixed schema. The payload is deterministic enough that a state machine is faster than any generic parser.
-- **HTTP**: `valyala/fasthttp`, no router, single handler.
-- **GC**: `GOGC=200` (less frequent GC, more memory headroom in steady state since hot path allocates nothing).
+## Warmup
 
-### Node
+The `GET /ready` handler runs 10,000 dummy queries against the loaded index in a tight loop before returning 200. This forces V8 TurboFan to compile every hot path before live traffic arrives. Without this, the first 50-100 requests show a 5-15 ms tail that lands directly in p99.
 
-- **HTTP**: `uNetworking/uWebSockets.js` v20+. ~10× faster than express, comparable to Go fasthttp on throughput.
-- **kNN**: `hnswlib-node` (native binding to `nmslib/hnswlib`). If memory is tight, build a thinner N-API binding around `unum-cloud/usearch` (int8 native).
-- **Index loading**: HNSW lib loads the same on-disk format the Go side builds. If the lib does not expose mmap, fall back to `Buffer.from(fs.readFileSync(...))` and accept the dup cost per instance.
-- **V8 flags**: `--max-old-space-size=80 --max-semi-space-size=4 --optimize-for-size`. JIT warmup at `/ready` with 200 sample queries.
-- **GC**: don't fight V8. Avoid allocations on the hot path (no object spread, reuse Buffers).
+## Forbidden responses
 
-## What we are NOT doing
+HTTP 5xx is the worst possible outcome: weight 5× + counts toward the 15% failure cliff. Any internal error in the hot path returns `{"approved":true,"fraud_score":0.0}` (one of the pre-baked responses) instead. The 1-3× detection penalty is preferable to the 5× error penalty.
 
-- **No C/Rust/Zig.** Out-of-stack for Vini. Optimizing in unfamiliar languages is negative-EV at this time budget.
-- **No custom CPU-bound workers / worker_threads in Node.** Single-request kNN finishes in microseconds; thread hop overhead is larger than the work.
-- **No GPU.** Even if it were allowed (it is not on the test rig).
-- **No caching of responses.** Test payloads are unique per transaction; cache hit rate would be ~0%.
-- **No payload validation past what is needed for vectorization.** Trust the input shape, fall back to safe response on parse failure.
+## Repo layout
 
-## Risks (ranked)
+```
+rinha-2026/
+├── Dockerfile.api          multi-stage: builds index + ships runtime
+├── Dockerfile.lb           haproxy slim
+├── docker-compose.yml      submission deliverable
+├── haproxy.cfg
+├── package.json
+├── tsconfig.json
+├── src/
+│   ├── api.ts              raw node:http + handlers
+│   ├── build-index.ts      build-time pipeline
+│   ├── vptree.ts           VP-tree build + iterative search
+│   ├── quantize.ts         int8 quantization
+│   ├── vector.ts           payload → vec14
+│   ├── heap.ts             top-5 max-heap with orig_id tie-break
+│   └── responses.ts        pre-baked response Buffers
+├── bench/
+│   └── k6.js               local load test
+├── data/                   gitignored
+└── docs/
+```
 
-1. **Recall < 99.5%** under HNSW pushes us into FN territory. FN weight = 3. Mitigation: exact rerank on top-20 candidates from ANN, validated against brute-force labels on 10k held-out queries before submission.
-2. **mmap page cache thrash** if the working set exceeds RAM. Mitigation: pre-touch all pages at `/ready`, profile RSS under load.
-3. **Cold-start latency**: first request after container warmup hits a cold mmap. The k6 test ramps up gradually so this should not show in p99, but we pre-warm anyway.
-4. **Node memory budget**: 110 MB × 2 = 220 MB just for instances. If we slip we drop to 1 API instance + LB (still compliant — spec says ≥2 instances). **Plan B**: 2 lighter instances by streaming the index from disk on first query (negative for p99).
-5. **HNSW lib quality variance** between Go and Node. If the Go-side index format is not loadable by `hnswlib-node`, we rebuild it in Node at startup from a shared int8 dump. ~5-10 s container startup overhead, no runtime cost.
-
-## Schedule (17 days, deadline 2026-06-05)
+## Schedule
 
 | Window | Goal | Status |
 |--------|------|--------|
-| D0 (2026-05-19) | Architecture doc + repo bootstrap | done |
-| D1-D3 | Node v0: correct, in budget, uWS + hnswlib-node + custom Go LB | |
-| D4-D5 | Index pipeline (Go build-index → on-disk binary) + k6 harness + scoring reproducer | |
-| D6-D7 | Node round 1: int8 + recall validation + hnswlib tuning | |
-| D8 | First Node `rinha/test` submission | |
-| D9-D10 | Node iteration based on ranking feedback | |
-| D11-D13 | Stretch: Go port IF Node is locked at top of stack | |
-| D14-D15 | Buffer + recall edge cases | |
-| D16 | Final submissions | |
+| D0 (2026-05-19) | Architecture + repo bootstrap | done |
+| D1 (this session) | Full Node submission ready to push, including index pipeline, API, LB, compose, bench | in progress |
+| D2-D7 | Local benchmark, recall validation, optimization rounds, V8 flag tuning | |
+| D8 | First `rinha/test` submission | |
+| D9-D15 | Iterate based on real ranking feedback | |
+| D16 | Final submission | |
 | D17 (2026-06-05) | Deadline | |
 
 ## Kill criteria
 
-- If by D3 Node cannot fit two instances + LB inside 350 MB even before the index, drop to one API instance (still spec-compliant).
-- If by D8 the Node submission scores below 3500 with no clear next 1000-point lever, the goal downgrades to "top-3 Node finish" and the Go stretch is dropped.
-- The Go stretch is only triggered if (a) the Node submission is at #1 of the Node stack by D10 and (b) total time spent so far is under 20 hours. Otherwise dropped.
-- If at any point this starts costing more than ~30 hours total, publish what we have, write the post, move on. The post is the durable artifact, not the rank.
+- If the index pipeline produces > 130 MB per instance, downsize to 1 API instance + LB (still spec-compliant) before changing stack.
+- If p99 stays above 5 ms after round 2 optimization, look harder at GC tail (every Buffer allocation in the hot path) before considering uWS swap.
+- The Go stretch from rev 1 is dropped. Competitive intel confirms Node can fight for #1 Node and top-10 overall; the Go pivot has lower expected value than further Node optimization.
+
+## Risks
+
+1. **VP-tree build time** at Docker build: ~130s in Node for 3M points on a dev machine, mostly JSON parsing. Acceptable (one-time cost).
+2. **GC tail latency**: every Buffer.concat or object literal in the hot path generates collectable garbage. Mitigation: hand-rolled tokenizer reads directly from req chunks into pre-allocated state machine, no concat. (round-2)
+3. **Tie-break correctness**: if our orig_id tie-break doesn't match the grader exactly, we get FPs/FNs even with mathematically correct distances. Validated against `test-data.json` (54100 cases): tie-break matches, **only the int8 quantization noise produces residual mismatches**.
+4. **HAProxy UDS file ownership**: requires shared volume between LB and API containers. Mitigation: declared volume in compose, both containers run as same UID.
+
+## Validated local results (2026-05-19)
+
+Local run of `make verify-detect` against the official `test-data.json`:
+
+```
+[verify] vectors=40.1MB tree=3000000 labels=366.2KB cases=54100
+[verify] TP=23998 TN=29991 FP=51 FN=60
+[verify] failure rate: 0.205%
+[verify] avg per-query: 483.1 µs
+```
+
+That converts to:
+
+```
+E             = 1·51 + 3·60 + 5·0     = 231
+ε             = 231 / 54100           = 0.00427
+rate_term     = 1000 · log10(1/0.00427) = 2370
+abs_penalty   = -300 · log10(1 + 231)   = -710
+detection_score                          = 1660
+```
+
+At p99 ≈ 2-3 ms in production (estimated from local µs measurement + HTTP overhead), `p99_score` lands between 2500 and 2800. Total estimated: **4200-4500 / 6000**.
+
+## Known gap and round-2 lever
+
+The 111 mismatches all sit at the 3/5 decision boundary where int8 quantization (resolution 1/127 ≈ 0.0079) rounds two neighbors into the same bucket and flips the 5th-position selection. The grader operates on float32 vectors so its top-5 occasionally differs from ours by one or two elements.
+
+**The cleanest fix**: keep the int8 vectors and VP-tree for traversal/pruning, AND store a parallel `float32` array of the same 3M × 14 vectors. The VP-tree's pruning bound is computed in int8 (cheap, slightly over-pruning is conservative and correct), but the distance INSERTED into the heap is computed in float32 from the parallel array. This produces exact grader-matching k=5 with no quantization noise.
+
+The memory cost is 168 MB for the float32 array. Per-instance that does not fit (135 MB budget). Two paths:
+
+a) **Shared mmap across both instances** via tmpfs. Linux page cache shares physical pages for the same file mmapped read-only by multiple processes. Node would need a small native module (or the `mmap-io` npm package) to expose `mmap`. Per-instance virtual size goes up but resident memory shares.
+
+b) **Drop to one API instance** (still spec-compliant: ≥2 instances is the rule; we currently run two for parallelism). One instance with 168 MB float vectors + 48 MB VP-tree + 42 MB int8 + 35 MB V8 = 293 MB, fits inside 350 MB with HAProxy.
+
+Path (a) is the right answer for a winning Node submission. Path (b) is a faster ship. Decision deferred to round 2 after first official `rinha/test` baseline.

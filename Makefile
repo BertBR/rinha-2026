@@ -1,16 +1,24 @@
 UPSTREAM := https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main
 DATA := data
 
-.PHONY: help data clean go-up go-down node-up node-down bench
+.PHONY: help data deps install build-index dev up down logs bench clean smoke verify-detect
 
 help:
-	@echo "make data       fetch reference files from upstream"
-	@echo "make go-up      docker compose up Go submission"
-	@echo "make node-up    docker compose up Node submission"
-	@echo "make bench      run k6 against running stack"
-	@echo "make clean      remove generated artifacts"
+	@echo "make deps         install npm deps locally (for dev / smoke tests)"
+	@echo "make data         fetch upstream reference and test files into data/"
+	@echo "make build-index  run the index builder locally (needs make data first)"
+	@echo "make up           docker compose up (full stack, builds index inside)"
+	@echo "make down         docker compose down"
+	@echo "make logs         tail compose logs"
+	@echo "make bench        run k6 against the running stack on :9999"
+	@echo "make smoke        in-process smoke test on a small reference subset"
+	@echo "make verify-detect  validate 0 FP / 0 FN against test-data.json"
+	@echo "make clean        remove generated artifacts"
 
-data: $(DATA)/references.json.gz $(DATA)/mcc_risk.json $(DATA)/normalization.json $(DATA)/example-payloads.json $(DATA)/test-data.json
+deps:
+	npm install
+
+data: $(DATA)/references.json.gz $(DATA)/mcc_risk.json $(DATA)/normalization.json $(DATA)/example-payloads.json $(DATA)/test-data.json $(DATA)/example-references.json
 
 $(DATA)/references.json.gz:
 	@mkdir -p $(DATA)
@@ -28,24 +36,35 @@ $(DATA)/example-payloads.json:
 	@mkdir -p $(DATA)
 	curl -sSL -o $@ $(UPSTREAM)/resources/example-payloads.json
 
+$(DATA)/example-references.json:
+	@mkdir -p $(DATA)
+	curl -sSL -o $@ $(UPSTREAM)/resources/example-references.json
+
 $(DATA)/test-data.json:
 	@mkdir -p $(DATA)
 	curl -sSL -o $@ $(UPSTREAM)/test/test-data.json
 
-go-up: data
-	docker compose -f docker-compose.go.yml up --build
+build-index: data
+	DATA_DIR=./data node --experimental-strip-types --max-old-space-size=4096 src/build-index.ts
 
-go-down:
-	docker compose -f docker-compose.go.yml down
+up: data
+	docker compose up --build
 
-node-up: data
-	docker compose -f docker-compose.node.yml up --build
+down:
+	docker compose down -v
 
-node-down:
-	docker compose -f docker-compose.node.yml down
+logs:
+	docker compose logs -f --tail=100
 
 bench:
 	k6 run bench/k6.js
 
+smoke:
+	DATA_DIR=./data node --experimental-strip-types src/test/smoke.ts
+
+verify-detect:
+	DATA_DIR=./data node --experimental-strip-types src/test/verify-detection.ts
+
 clean:
-	rm -rf go/bin go/dist node/dist data/*.bin data/*.index
+	rm -rf node_modules
+	rm -f data/*.bin

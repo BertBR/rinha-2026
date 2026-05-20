@@ -1,0 +1,11 @@
+{
+  "repos": [
+    {
+      "name": "rinha-2026",
+      "url": "https://github.com/BertBR/rinha-2026",
+      "language": "Node.js",
+      "stack": "raw node:http + VP-tree (int8) + HAProxy",
+      "author": "Vinícius Nascimento"
+    }
+  ]
+}

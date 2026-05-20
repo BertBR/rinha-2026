@@ -1,24 +1,21 @@
 data/*
 !data/.gitkeep
 
-# Go
-go/bin/
-go/dist/
+node_modules/
+dist/
+.npm/
+
 *.test
 *.out
-
-# Node
-node/node_modules/
-node/dist/
-node/.npm/
-
-# Build artifacts
 *.index
 *.bin
 *.idx
 
-# OS / editors
 .DS_Store
 .vscode/
 .idea/
 *.swp
+
+*.cpuprofile
+*.heapprofile
+.tap/

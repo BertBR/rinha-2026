@@ -1,0 +1,13 @@
+.git
+.gitignore
+.github
+node_modules
+data/*.gz
+data/*.json
+data/*.bin
+docs/
+README.md
+bench/
+*.md
+.vscode
+.idea
