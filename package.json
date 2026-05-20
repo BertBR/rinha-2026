@@ -12,7 +12,8 @@
     "test": "node --experimental-strip-types src/test/smoke.ts"
   },
   "dependencies": {
-    "stream-json": "^1.8.0"
+    "stream-json": "^1.8.0",
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.52.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0"
