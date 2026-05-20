@@ -33,7 +33,7 @@ RUN node --experimental-strip-types --max-old-space-size=4096 src/build-index.ts
 FROM node:22-bookworm-slim AS runtime
 WORKDIR /app
 
-ENV NODE_OPTIONS="--max-old-space-size=96 --max-semi-space-size=4 --optimize-for-size"
+ENV NODE_OPTIONS="--max-old-space-size=96 --max-semi-space-size=4"
 ENV DATA_DIR=/app/data
 ENV UDS_PATH=/sockets/api.sock
 ENV WARMUP_QUERIES=10000
@@ -51,4 +51,4 @@ COPY --from=index-builder /build/data/vptree.bin /app/data/vptree.bin
 COPY --from=index-builder /build/data/mcc_risk.json /app/data/mcc_risk.json
 COPY --from=index-builder /build/data/normalization.json /app/data/normalization.json
 
-CMD ["node", "--experimental-strip-types", "src/api.ts"]
+CMD ["node", "--experimental-strip-types", "--optimize-for-size", "src/api.ts"]
