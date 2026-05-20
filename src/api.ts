@@ -177,7 +177,13 @@ async function main(): Promise<void> {
   warmup();
   ready = true;
 
+  let firstReq = true;
+  let firstConn = true;
   const server = createServer((req, res) => {
+    if (firstReq) {
+      firstReq = false;
+      console.log(`[api] first request: ${req.method} ${req.url}`);
+    }
     if (req.method === 'POST' && req.url === '/fraud-score') {
       handleFraudScore(req, res);
     } else if (req.method === 'GET' && req.url === '/ready') {
@@ -188,10 +194,25 @@ async function main(): Promise<void> {
     }
   });
 
-  server.keepAliveTimeout = 60_000;
-  server.requestTimeout = 0;
-  server.headersTimeout = 60_000;
-  server.maxConnections = 0;
+  server.on('connection', () => {
+    if (firstConn) {
+      firstConn = false;
+      console.log(`[api] first connection accepted`);
+    }
+  });
+
+  server.on('clientError', (err, socket) => {
+    console.log(`[api] clientError: ${(err as Error).message} code=${(err as any).code}`);
+    try {
+      socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    } catch {
+      // ignore
+    }
+  });
+
+  server.on('error', (err) => {
+    console.log(`[api] server error: ${err.message}`);
+  });
 
   if (UDS_PATH.startsWith('/')) {
     if (existsSync(UDS_PATH)) {
