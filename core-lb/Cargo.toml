@@ -1,0 +1,18 @@
+[package]
+name = "rinha-lb"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rinha-lb"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "signal"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
