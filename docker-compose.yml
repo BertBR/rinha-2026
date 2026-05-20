@@ -1,9 +1,7 @@
 name: rinha-2026
 
 x-api: &api-template
-  build:
-    context: .
-    dockerfile: Dockerfile.api
+  image: ghcr.io/bertbr/rinha-2026-api:latest
   restart: unless-stopped
   volumes:
     - sockets:/sockets
@@ -38,15 +36,14 @@ services:
           memory: "155MB"
 
   lb:
-    build:
-      context: .
-      dockerfile: Dockerfile.lb
+    image: haproxy:3.0-alpine
     container_name: rinha-lb
     restart: unless-stopped
     depends_on:
       - api1
       - api2
     volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - sockets:/sockets
     ports:
       - "9999:9999"
