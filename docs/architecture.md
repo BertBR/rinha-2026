@@ -4,8 +4,10 @@
 
 ## Goal
 
-First place in **Go** and first place in **Node.js** at Rinha de Backend 2026.
-Pódium geral is not the target. Anyone writing hand-rolled C++ with SIMD intrinsics will be ahead and that is fine.
+First place in the **Node.js** stack at Rinha de Backend 2026.
+A Go port is a stretch goal, attempted only if the Node submission is locked at the top of its stack by D10. Pódium geral is not the target — anyone writing hand-rolled C++ with SIMD intrinsics will be ahead and that is fine.
+
+**Why Node-first** (full reasoning in `docs/stack-choice.md`): primary daily stack, less competitive field, hnswlib-node native binding lifts the heavy compute out of V8, blog post defendable in interviews, tighter thematic fit with target pipeline (Speechify Platform, Clara AI, LemFi, Anthropic Skills).
 
 ## Constraints (recap)
 
@@ -89,19 +91,20 @@ GOMAXPROCS=1 inside the container. We are not parallelizing kNN inside a single 
 
 | Window | Goal | Status |
 |--------|------|--------|
-| D0 (2026-05-19) | Architecture doc + repo bootstrap | in progress |
-| D1-D3 | Go v0: correct, in budget, naive perf | |
-| D4-D5 | Index pipeline + k6 harness + scoring reproducer | |
-| D6-D7 | Go round 1: int8 + recall validation + HNSW tuning | |
-| D8 | First Go `rinha/test` submission | |
-| D9-D11 | Node port | |
-| D12-D13 | Round 2 optimization both stacks | |
+| D0 (2026-05-19) | Architecture doc + repo bootstrap | done |
+| D1-D3 | Node v0: correct, in budget, uWS + hnswlib-node + custom Go LB | |
+| D4-D5 | Index pipeline (Go build-index → on-disk binary) + k6 harness + scoring reproducer | |
+| D6-D7 | Node round 1: int8 + recall validation + hnswlib tuning | |
+| D8 | First Node `rinha/test` submission | |
+| D9-D10 | Node iteration based on ranking feedback | |
+| D11-D13 | Stretch: Go port IF Node is locked at top of stack | |
 | D14-D15 | Buffer + recall edge cases | |
 | D16 | Final submissions | |
 | D17 (2026-06-05) | Deadline | |
 
 ## Kill criteria
 
-- If by D8 the Go submission scores below 3500 with no clear next 1000-point lever, the goal downgrades to "respectable Go finish" and Node work is dropped.
-- If by D11 Node cannot fit in memory budget with hnswlib-node, downgrade to 1 API instance (still spec-compliant).
-- If at any point this starts costing more than ~30 hours total (across all days), publish what we have, write the post, move on. The post is the durable artifact, not the rank.
+- If by D3 Node cannot fit two instances + LB inside 350 MB even before the index, drop to one API instance (still spec-compliant).
+- If by D8 the Node submission scores below 3500 with no clear next 1000-point lever, the goal downgrades to "top-3 Node finish" and the Go stretch is dropped.
+- The Go stretch is only triggered if (a) the Node submission is at #1 of the Node stack by D10 and (b) total time spent so far is under 20 hours. Otherwise dropped.
+- If at any point this starts costing more than ~30 hours total, publish what we have, write the post, move on. The post is the durable artifact, not the rank.
