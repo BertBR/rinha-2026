@@ -13,8 +13,8 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends curl ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-COPY package.json ./
-RUN npm install --omit=dev --no-audit --no-fund
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
 
 COPY tsconfig.json ./
 COPY src ./src
@@ -38,8 +38,8 @@ ENV DATA_DIR=/app/data
 ENV UDS_PATH=/sockets/api.sock
 ENV WARMUP_QUERIES=10000
 
-COPY package.json ./
-RUN npm install --omit=dev --no-audit --no-fund
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 
 COPY tsconfig.json ./
 COPY src ./src
