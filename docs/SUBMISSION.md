@@ -28,11 +28,16 @@ This builds (or checks out) the `submission` branch and force-pushes a clean sna
 
 ## Triggering the official test
 
-Open an issue on this repo with `rinha/test` in the description. The Rinha engine watches for that string, runs the test, posts the score as a comment, and closes the issue.
+The `rinha/test` issue must be opened on the **upstream** repo `zanfranceschi/rinha-de-backend-2026`, and the title must match the pattern `rinha/test <participant-id>` (where `<participant-id>` is the `id` field from your `participants/<user>.json`, which is `rinha-2026` for us).
 
 ```bash
-gh issue create -t "rinha test" -b "rinha/test"
+gh issue create \
+  --repo zanfranceschi/rinha-de-backend-2026 \
+  --title "rinha/test rinha-2026" \
+  --body "rinha/test rinha-2026"
 ```
+
+The bot `@arinhadebackend` replies with the result and closes the issue.
 
 The result comment will contain the JSON described in upstream `EVALUATION.md`:
 
