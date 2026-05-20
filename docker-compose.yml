@@ -1,7 +1,7 @@
 name: rinha-2026
 
 x-api: &api-template
-  image: ghcr.io/bertbr/rinha-2026-api:vpt3-r1
+  image: ghcr.io/bertbr/rinha-2026-api:int8-stable
   pull_policy: always
   restart: unless-stopped
   volumes:
@@ -22,7 +22,7 @@ services:
       resources:
         limits:
           cpus: "0.40"
-          memory: "165MB"
+          memory: "160MB"
 
   api2:
     <<: *api-template
@@ -34,7 +34,7 @@ services:
       resources:
         limits:
           cpus: "0.40"
-          memory: "165MB"
+          memory: "160MB"
 
   lb:
     image: haproxy:3.0-alpine
@@ -52,7 +52,7 @@ services:
       resources:
         limits:
           cpus: "0.20"
-          memory: "20MB"
+          memory: "30MB"
     ulimits:
       nofile:
         soft: 65536
