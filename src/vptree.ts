@@ -1,4 +1,4 @@
-// VP-tree over int8-quantized 14-dim vectors. Exact k-NN with tie-break on
+// VP-tree over int16-quantized 14-dim vectors. Exact k-NN with tie-break on
 // original index, matching the grader's brute-force ordering.
 //
 // Storage layout (typed arrays, no objects):
@@ -8,9 +8,11 @@
 //   leftOffset[node]  : Int32   node index of left subtree root, -1 if none
 //   rightOffset[node] : Int32   node index of right subtree root, -1 if none
 //
-// Each node is 16 bytes. 3M nodes → 48 MB.
+// 16 bytes per node. 3M nodes → 48 MB. Kept simple (no bit-packing) because
+// the access pattern is mostly cache-line-fetched and a packed format would
+// trade saving 15 MB for several extra ALU ops per node visit.
 
-import { DIMS, distanceSqInt8 } from './quantize.ts';
+import { DIMS, distanceSqInt16 } from './quantize.ts';
 import { TopKHeap } from './heap.ts';
 
 export interface VpTree {
@@ -23,7 +25,7 @@ export interface VpTree {
 
 const STACK_DEPTH = 128;
 
-export function buildVpTree(vectors: Int8Array, N: number): VpTree {
+export function buildVpTree(vectors: Int16Array, N: number): VpTree {
   const pointIdx = new Uint32Array(N);
   const threshold = new Float32Array(N);
   const leftOffset = new Int32Array(N);
@@ -35,8 +37,6 @@ export function buildVpTree(vectors: Int8Array, N: number): VpTree {
   const dists = new Float64Array(N);
   let nodeCount = 0;
 
-  // Iterative balanced build with explicit stack.
-  // Stack frame: [start, end, parentNode, side]  side: 0=root, 1=left, 2=right
   const stack: number[] = [];
   stack.push(0, N, -1, 0);
 
@@ -91,9 +91,6 @@ export function buildVpTree(vectors: Int8Array, N: number): VpTree {
     const medianPos = subStart + (subLen >> 1);
     threshold[nodeIdx] = Math.sqrt(dists[medianPos]);
 
-    // Push right first, then left. With a real stack (FIFO unrolled to LIFO),
-    // left will be popped first, giving an in-order build (smaller subtrees
-    // first for cache locality).
     stack.push(medianPos, subEnd, nodeIdx, 2);
     stack.push(subStart, medianPos, nodeIdx, 1);
   }
@@ -113,7 +110,6 @@ function sortByDist(
   start: number,
   end: number,
 ): void {
-  // Simple in-place quicksort. Used only at build time.
   if (end - start <= 1) return;
   const stack: number[] = [start, end];
   while (stack.length > 0) {
@@ -161,8 +157,8 @@ const SEARCH_STACK = new Int32Array(STACK_DEPTH);
 
 export function searchVpTree(
   tree: VpTree,
-  vectors: Int8Array,
-  query: Int8Array,
+  vectors: Int16Array,
+  query: Int16Array,
   heap: TopKHeap,
 ): void {
   heap.reset();
@@ -180,7 +176,7 @@ export function searchVpTree(
 
     const vpPtIdx = pointIdx[nodeIdx];
     const vpOffset = vpPtIdx * DIMS;
-    const dSq = distanceSqInt8(query, vectors, vpOffset);
+    const dSq = distanceSqInt16(query, vectors, vpOffset);
 
     heap.tryInsert(dSq, vpPtIdx);
 
@@ -213,21 +209,18 @@ export function searchVpTree(
   }
 }
 
-// Serialize VP-tree to a single Buffer. Header: 16 bytes
-//   uint32 magic = 0x56505431  ("VPT1")
+// Serialize to a single Buffer. Header: 16 bytes
+//   uint32 magic = 0x56505432  ("VPT2", bumped from VPT1 for int16 format)
 //   uint32 size
 //   uint32 reserved
 //   uint32 reserved
-// Then four parallel arrays:
-//   pointIdx   : size * 4
-//   threshold  : size * 4
-//   leftOffset : size * 4
-//   rightOffset: size * 4
+// Then four parallel arrays of size * 4 bytes:
+//   pointIdx (uint32), threshold (float32), leftOffset (int32), rightOffset (int32)
 export function serializeVpTree(tree: VpTree): Buffer {
   const N = tree.size;
   const bufSize = 16 + N * 16;
   const buf = Buffer.alloc(bufSize);
-  buf.writeUInt32LE(0x56505431, 0);
+  buf.writeUInt32LE(0x56505432, 0);
   buf.writeUInt32LE(N, 4);
 
   const u32 = new Uint32Array(buf.buffer, buf.byteOffset + 16, N);
@@ -247,8 +240,8 @@ export function serializeVpTree(tree: VpTree): Buffer {
 
 export function deserializeVpTree(buf: Buffer): VpTree {
   const magic = buf.readUInt32LE(0);
-  if (magic !== 0x56505431) {
-    throw new Error(`bad vptree magic: 0x${magic.toString(16)}`);
+  if (magic !== 0x56505432) {
+    throw new Error(`bad vptree magic: 0x${magic.toString(16)} (expected VPT2)`);
   }
   const N = buf.readUInt32LE(4);
   const base = buf.byteOffset + 16;
