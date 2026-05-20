@@ -5,21 +5,16 @@
 //
 // Tie-break rule (smaller idx wins on equal distance) matches the grader's
 // brute-force ordering. Without this we get spurious FP/FN on tied neighbors.
-//
-// Distances are stored as float64 (Float64Array) because int16 quantization
-// produces sums that occasionally exceed int32 (max ~6e10 across 14 dims).
-
-const INF = Number.POSITIVE_INFINITY;
 
 export class TopKHeap {
   readonly k: number;
-  readonly dists: Float64Array;
+  readonly dists: Int32Array;
   readonly idxs: Int32Array;
   size: number;
 
   constructor(k: number) {
     this.k = k;
-    this.dists = new Float64Array(k);
+    this.dists = new Int32Array(k);
     this.idxs = new Int32Array(k);
     this.size = 0;
   }
@@ -29,7 +24,7 @@ export class TopKHeap {
   }
 
   worst(): number {
-    return this.size < this.k ? INF : this.dists[0];
+    return this.size < this.k ? 0x7fffffff : this.dists[0];
   }
 
   tryInsert(dist: number, idx: number): void {

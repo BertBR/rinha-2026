@@ -41,7 +41,7 @@ async function main(): Promise<void> {
     fs.readFile(`${DATA_DIR}/test-data.json`, 'utf8'),
   ]);
 
-  const vectors = new Int16Array(vBuf.buffer, vBuf.byteOffset, vBuf.byteLength / 2);
+  const vectors = new Int8Array(vBuf.buffer, vBuf.byteOffset, vBuf.byteLength);
   const labels = new Uint8Array(lBuf.buffer, lBuf.byteOffset, lBuf.byteLength);
   const tree = deserializeVpTree(tBuf);
   const norm = JSON.parse(normRaw) as Normalization;
@@ -54,7 +54,7 @@ async function main(): Promise<void> {
   );
 
   const queryFloat = new Float32Array(DIMS);
-  const queryInt8 = new Int16Array(DIMS);
+  const queryInt8 = new Int8Array(DIMS);
   const heap = new TopKHeap(5);
 
   let tp = 0;

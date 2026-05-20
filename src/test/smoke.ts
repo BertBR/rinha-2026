@@ -44,7 +44,7 @@ async function main(): Promise<void> {
   console.log(`[smoke] refs=${refs.length} payloads=${payloads.length}`);
 
   const N = refs.length;
-  const vectors = new Int16Array(N * DIMS);
+  const vectors = new Int8Array(N * DIMS);
   const labels = new Uint8Array(Math.ceil(N / 8));
 
   for (let i = 0; i < N; i++) {
@@ -66,7 +66,7 @@ async function main(): Promise<void> {
   assertEq(tree2.size, tree.size, 'serialize round-trip size');
 
   const queryFloat = new Float32Array(DIMS);
-  const queryInt8 = new Int16Array(DIMS);
+  const queryInt8 = new Int8Array(DIMS);
   const heap = new TopKHeap(5);
 
   let queriesRun = 0;
@@ -96,8 +96,8 @@ async function main(): Promise<void> {
 }
 
 function bruteForceTop5(
-  vectors: Int16Array,
-  query: Int16Array,
+  vectors: Int8Array,
+  query: Int8Array,
   N: number,
 ): Array<{ d: number; i: number }> {
   const all: Array<{ d: number; i: number }> = new Array(N);

@@ -35,7 +35,7 @@ async function main(): Promise<void> {
 
   // 1. Stream-decompress + parse + quantize.
   const initialCap = 3_000_000;
-  let vectors = new Int16Array(initialCap * DIMS);
+  let vectors = new Int8Array(initialCap * DIMS);
   let labels = new Uint8Array(Math.ceil(initialCap / 8));
   let count = 0;
   let cap = initialCap;
@@ -54,7 +54,7 @@ async function main(): Promise<void> {
 
     if (count >= cap) {
       const newCap = Math.floor(cap * 1.5);
-      const newVec = new Int16Array(newCap * DIMS);
+      const newVec = new Int8Array(newCap * DIMS);
       newVec.set(vectors);
       vectors = newVec;
       const newLab = new Uint8Array(Math.ceil(newCap / 8));
@@ -71,7 +71,7 @@ async function main(): Promise<void> {
       } else {
         let q = Math.round(v * QUANT_SCALE);
         if (q < 0) q = 0;
-        if (q > 32767) q = 32767;
+        if (q > 127) q = 127;
         vectors[base + j] = q;
       }
     }

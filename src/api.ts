@@ -25,7 +25,7 @@ const UDS_PATH = process.env.UDS_PATH ?? '/sockets/api.sock';
 const WARMUP_QUERIES = Number(process.env.WARMUP_QUERIES ?? 3_000);
 
 interface LoadedIndex {
-  vectors: Int16Array;
+  vectors: Int8Array;
   labels: Uint8Array;
   tree: ReturnType<typeof deserializeVpTree>;
   norm: Normalization;
@@ -34,7 +34,7 @@ interface LoadedIndex {
 
 const heap = new TopKHeap(5);
 const queryFloat = new Float32Array(DIMS);
-const queryInt8 = new Int16Array(DIMS);
+const queryInt8 = new Int8Array(DIMS);
 
 let ready = false;
 let index: LoadedIndex | null = null;
@@ -50,7 +50,7 @@ async function loadIndex(): Promise<LoadedIndex> {
     fs.readFile(`${DATA_DIR}/mcc_risk.json`, 'utf8'),
   ]);
 
-  const vectors = new Int16Array(vBuf.buffer, vBuf.byteOffset, vBuf.byteLength / 2);
+  const vectors = new Int8Array(vBuf.buffer, vBuf.byteOffset, vBuf.byteLength);
   const labels = new Uint8Array(lBuf.buffer, lBuf.byteOffset, lBuf.byteLength);
   const tree = deserializeVpTree(tBuf);
   const norm = JSON.parse(normRaw) as Normalization;
