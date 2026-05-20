@@ -12,8 +12,8 @@ use crate::data::{dataset, Dataset, DIMS, QUANT_SCALE};
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
-const FAST_NPROBE: usize = 8;
-const FULL_NPROBE: usize = 32;
+const FAST_NPROBE: usize = 12;
+const FULL_NPROBE: usize = 64;
 const MAX_CENTROIDS: usize = 8192;
 
 pub fn query(q: &[f32; 14], ds: &Dataset) -> u8 {
