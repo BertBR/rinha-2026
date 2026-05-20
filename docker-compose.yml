@@ -18,24 +18,24 @@ services:
     container_name: rinha-api1
     environment:
       UDS_PATH: /sockets/api1.sock
-      WARMUP_QUERIES: 10000
+      WARMUP_QUERIES: 3000
     deploy:
       resources:
         limits:
           cpus: "0.40"
-          memory: "135MB"
+          memory: "155MB"
 
   api2:
     <<: *api-template
     container_name: rinha-api2
     environment:
       UDS_PATH: /sockets/api2.sock
-      WARMUP_QUERIES: 10000
+      WARMUP_QUERIES: 3000
     deploy:
       resources:
         limits:
           cpus: "0.40"
-          memory: "135MB"
+          memory: "155MB"
 
   lb:
     build:
