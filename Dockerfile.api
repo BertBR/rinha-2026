@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1.7
+
+# ---- Stage 1: index builder ----
+# Downloads the upstream reference dataset, decompresses, quantizes, builds the
+# VP-tree, and emits three binaries that the runtime stage will copy.
+FROM node:22-bookworm-slim AS index-builder
+WORKDIR /build
+
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+ENV DATA_DIR=/build/data
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends curl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
+
+COPY tsconfig.json ./
+COPY src ./src
+
+RUN mkdir -p /build/data && \
+    curl -sSL -o /build/data/references.json.gz \
+      https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/references.json.gz && \
+    curl -sSL -o /build/data/mcc_risk.json \
+      https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/mcc_risk.json && \
+    curl -sSL -o /build/data/normalization.json \
+      https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/normalization.json
+
+RUN node --experimental-strip-types --max-old-space-size=4096 src/build-index.ts
+
+# ---- Stage 2: runtime ----
+FROM node:22-bookworm-slim AS runtime
+WORKDIR /app
+
+ENV NODE_OPTIONS="--max-old-space-size=96 --max-semi-space-size=4 --optimize-for-size"
+ENV DATA_DIR=/app/data
+ENV UDS_PATH=/sockets/api.sock
+ENV WARMUP_QUERIES=10000
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+
+COPY tsconfig.json ./
+COPY src ./src
+
+RUN mkdir -p /app/data
+COPY --from=index-builder /build/data/vectors.bin /app/data/vectors.bin
+COPY --from=index-builder /build/data/labels.bin /app/data/labels.bin
+COPY --from=index-builder /build/data/vptree.bin /app/data/vptree.bin
+COPY --from=index-builder /build/data/mcc_risk.json /app/data/mcc_risk.json
+COPY --from=index-builder /build/data/normalization.json /app/data/normalization.json
+
+CMD ["node", "--experimental-strip-types", "src/api.ts"]
