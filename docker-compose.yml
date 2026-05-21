@@ -1,7 +1,7 @@
 name: rinha-2026
 
 x-api: &api-template
-  image: ghcr.io/bertbr/rinha-2026-api:go-r4
+  image: ghcr.io/bertbr/rinha-2026-api:go-r6
   pull_policy: always
   restart: unless-stopped
   volumes:
@@ -16,7 +16,7 @@ services:
     <<: *api-template
     container_name: rinha-api1
     environment:
-      UDS_PATH: /sockets/api1.sock
+      CTRL_SOCKET: /sockets/api1.ctrl
       GOMAXPROCS: "2"
       GOGC: "200"
     deploy:
@@ -29,7 +29,7 @@ services:
     <<: *api-template
     container_name: rinha-api2
     environment:
-      UDS_PATH: /sockets/api2.sock
+      CTRL_SOCKET: /sockets/api2.ctrl
       GOMAXPROCS: "2"
       GOGC: "200"
     deploy:
@@ -39,15 +39,18 @@ services:
           memory: "160MB"
 
   lb:
-    image: haproxy:3.0-alpine
+    image: ghcr.io/bertbr/rinha-2026-lb:go-r1
+    pull_policy: always
     container_name: rinha-lb
     restart: unless-stopped
     depends_on:
       - api1
       - api2
+    command:
+      - "-listen=:9999"
+      - "-workers=/sockets/api1.ctrl,/sockets/api2.ctrl"
     volumes:
       - sockets:/sockets
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
       - "9999:9999"
     deploy:
