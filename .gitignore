@@ -19,3 +19,16 @@ dist/
 *.cpuprofile
 *.heapprofile
 .tap/
+
+# Go
+/api
+cmd/api/api
+bin/
+vendor/
+
+# Rust build artifacts (already produced inside Docker; never commit)
+core/target/
+core-lb/target/
+
+# Local-only compose backup
+docker-compose.node.yml.bak

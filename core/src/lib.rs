@@ -10,21 +10,24 @@
 //     the 2/5 or 3/5 fraud-count boundary (sensitive to misranked neighbors),
 //     escalate to FULL_NPROBE=32 for confirmation.
 //
-// Exposes two N-API functions to Node:
-//   initKnn()                                    -> ()
-//   knnFraudCount(v0, v1, ..., v13: f64)         -> u8 (count of frauds in top-5)
+// Two parallel surfaces share the same kNN core:
+//   N-API (Node): init_knn() / knn_fraud_count(...)
+//   C ABI  (Go): rinha_knn_init() / rinha_knn_fraud_count(*const f32)
 
 mod data;
 mod knn;
 
+#[cfg(feature = "node")]
 use napi_derive::napi;
 
+#[cfg(feature = "node")]
 #[napi]
 pub fn init_knn() {
     data::init();
     knn::warmup();
 }
 
+#[cfg(feature = "node")]
 #[napi]
 #[allow(clippy::too_many_arguments)]
 pub fn knn_fraud_count(
@@ -48,4 +51,18 @@ pub fn knn_fraud_count(
         v8 as f32, v9 as f32, v10 as f32, v11 as f32, v12 as f32, v13 as f32,
     ];
     knn::query(&q, data::dataset())
+}
+
+#[no_mangle]
+pub extern "C" fn rinha_knn_init() {
+    data::init();
+    knn::warmup();
+}
+
+/// Query the kNN index. `q` must point to 14 contiguous f32 values.
+/// Safe to call from any thread after `rinha_knn_init` has run.
+#[no_mangle]
+pub unsafe extern "C" fn rinha_knn_fraud_count(q: *const f32) -> u8 {
+    let q_arr = &*(q as *const [f32; 14]);
+    knn::query(q_arr, data::dataset())
 }

@@ -1,1 +1,0 @@
-{"rustc":7458672600737419911,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[13548984313718623784,"build_script_build",false,371931043362772759]],"local":[{"RerunIfChanged":{"output":"release/build/serde-c3a2e85b78c167b9/output","paths":["build.rs"]}}],"rustflags":["-C","target-feature=+avx2,+fma"],"config":0,"compile_kind":0}

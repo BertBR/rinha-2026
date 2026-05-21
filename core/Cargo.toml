@@ -10,15 +10,21 @@ crate-type = ["cdylib"]
 name = "build-ivf"
 path = "src/build_ivf.rs"
 
+[features]
+default = ["node"]
+# Default builds a Node-loadable .node addon (N-API symbols exported).
+# Build with --no-default-features to produce a clean C-ABI-only .so for cgo.
+node = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
+
 [dependencies]
-napi = { version = "2", features = ["napi6"] }
-napi-derive = "2"
+napi = { version = "2", features = ["napi6"], optional = true }
+napi-derive = { version = "2", optional = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [build-dependencies]
-napi-build = "2"
+napi-build = { version = "2", optional = true }
 
 [profile.release]
 opt-level = 3

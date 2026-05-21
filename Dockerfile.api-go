@@ -1,0 +1,75 @@
+# syntax=docker/dockerfile:1.7
+
+# ---- Stage 1: Rust builder ----
+# Downloads upstream references, builds the IVF index, compiles the kNN
+# cdylib with AVX2 + FMA. Built with --no-default-features so the .so
+# exports only the C ABI (no napi symbols) — cgo-loadable.
+FROM rust:1-slim-bookworm AS rust-builder
+WORKDIR /build
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends curl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY core/Cargo.toml core/build.rs ./core/
+COPY core/src ./core/src
+
+RUN curl -sSL -o /build/references.json.gz \
+      https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/references.json.gz
+
+WORKDIR /build/core
+RUN mkdir -p data && touch data/index.bin.gz
+ENV RUSTFLAGS="-C target-feature=+avx2,+fma -C target-cpu=haswell"
+RUN cargo build --release --bin build-ivf --no-default-features
+RUN ./target/release/build-ivf /build/references.json.gz ./data/index.bin.gz 2048 3
+RUN cargo build --release --lib --no-default-features
+
+# ---- Stage 2: Go builder ----
+FROM golang:1.23-bookworm AS go-builder
+WORKDIR /src
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends build-essential \
+  && rm -rf /var/lib/apt/lists/*
+
+# Bring in the Rust artifact + headers so cgo can link.
+COPY --from=rust-builder /build/core/target/release/librinha_knn.so /src/core/target/release/librinha_knn.so
+COPY core/rinha_knn.h /src/core/rinha_knn.h
+
+COPY go.mod ./
+COPY cmd ./cmd
+COPY internal ./internal
+
+# Static-ish build, but cgo dynamically links to the .so. We embed an rpath
+# pointing to /app so the runtime image can keep the .so next to the binary.
+ENV CGO_ENABLED=1
+ENV GOFLAGS="-trimpath"
+RUN go build \
+      -ldflags="-s -w -extldflags=-Wl,-rpath,/app" \
+      -o /out/api \
+      ./cmd/api
+
+# ---- Stage 3: Runtime ----
+FROM debian:bookworm-slim
+WORKDIR /app
+
+ENV DATA_DIR=/app/data
+ENV UDS_PATH=/sockets/api.sock
+ENV GOMAXPROCS=1
+ENV GOGC=200
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends curl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=rust-builder /build/core/target/release/librinha_knn.so /app/librinha_knn.so
+COPY --from=go-builder /out/api /app/api
+
+RUN mkdir -p /app/data /sockets \
+  && curl -sSL -o /app/data/normalization.json \
+       https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/normalization.json \
+  && curl -sSL -o /app/data/mcc_risk.json \
+       https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/mcc_risk.json \
+  && apt-get purge -y --auto-remove curl ca-certificates
+
+CMD ["/app/api"]
