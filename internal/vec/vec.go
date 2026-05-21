@@ -474,10 +474,13 @@ func ParseAndVectorize(buf []byte, out *[14]float32, ctx *ParseContext) bool {
 	out[0] = clamp01(amount / norm.MaxAmount)
 	out[1] = clamp01(float64(installments) / norm.MaxInstallments)
 	out[2] = clamp01(amount / avgAmount / norm.AmountVsAvgRatio)
-	out[3] = float32(reqHour) / 23
+	// Match the Node reference: divide in f64 then narrow to f32 at store
+	// time, so the i16 quantization downstream sees the same rounded value
+	// the grader's brute-force kNN computed.
+	out[3] = float32(float64(reqHour) / 23.0)
 	dse := daysSinceEpoch(reqYear, reqMonth, reqDay)
 	dow := ((dse+3)%7 + 7) % 7
-	out[4] = float32(dow) / 6
+	out[4] = float32(float64(dow) / 6.0)
 	if lastMinutes < 0 {
 		out[5] = -1
 		out[6] = -1

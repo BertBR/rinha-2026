@@ -92,10 +92,11 @@ func main() {
 	mux.HandleFunc("POST /fraud-score", handleFraudScore)
 
 	srv := &http.Server{
-		Handler:      mux,
-		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 30 * time.Second, // generous so the first request can wait through init
-		IdleTimeout:  60 * time.Second,
+		Handler:     mux,
+		IdleTimeout: 60 * time.Second,
+		// No Read/WriteTimeout: each adds a per-request timer and a deadline
+		// system call. HAProxy already enforces upstream limits (timeout
+		// server 2s) so the api side doesn't need its own bound.
 	}
 
 	log.Printf("[api] listening on UDS %s (GOMAXPROCS=%d)", udsPath, runtime.GOMAXPROCS(0))
