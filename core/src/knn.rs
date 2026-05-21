@@ -15,8 +15,6 @@ use crate::data::{dataset, Dataset, DIMS, QUANT_SCALE};
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
-const FAST_NPROBE: usize = 12;
-const FULL_NPROBE: usize = 64;
 const MAX_CENTROIDS: usize = 8192;
 
 pub fn query(q: &[f32; 14], ds: &Dataset) -> u8 {
@@ -25,27 +23,41 @@ pub fn query(q: &[f32; 14], ds: &Dataset) -> u8 {
 
 #[target_feature(enable = "avx2,fma")]
 unsafe fn query_avx2(q: &[f32; 14], ds: &Dataset) -> u8 {
-    let mut cdists = [MaybeUninit::<f32>::uninit(); MAX_CENTROIDS];
-    centroid_distances(q, ds, &mut cdists);
-
-    let fast = top_k_indices::<FAST_NPROBE>(&cdists, ds.k);
-
-    // Quantize query to i16 once.
     let mut qi = [0i16; 14];
     quantize_query(q, &mut qi);
 
-    let mut heap = Heap5::new();
-    scan_buckets(&qi, ds, &fast, &mut heap);
-    let fast_count = heap.count_frauds();
+    // Compute centroid distances in i16-quantized space so the triangle
+    // inequality bound matches the per-bucket scan metric exactly.
+    let mut cdists_i32 = [0i32; MAX_CENTROIDS];
+    centroid_distances_i16(&qi, ds, &mut cdists_i32);
 
-    if fast_count != 2 && fast_count != 3 {
-        return fast_count;
-    }
-
-    let full = top_k_indices::<FULL_NPROBE>(&cdists, ds.k);
+    // Exact kNN via bbox-pruned bucket scan: iterate buckets in increasing
+    // centroid-distance order; prune any whose lower bound (triangle
+    // inequality: dist(q, v) >= dist(q, c) - radius(b)) already exceeds
+    // the heap's current 5th-nearest. ~5-10% of buckets scanned per
+    // query, exact result, eliminates the count==0/5 holes conditional
+    // escalation couldn't catch.
     let mut heap = Heap5::new();
-    scan_buckets(&qi, ds, &full, &mut heap);
+    scan_buckets_pruned(&qi, &cdists_i32, ds, &mut heap);
     heap.count_frauds()
+}
+
+// i16-space centroid distance: sum of squared diffs between qi and each
+// centroid's i16 quantization. Stored as i32 to avoid overflow
+// (max single diff ~65535, max sum-of-squares for 14 dims fits).
+#[target_feature(enable = "avx2,fma")]
+unsafe fn centroid_distances_i16(qi: &[i16; 14], ds: &Dataset, out: &mut [i32; MAX_CENTROIDS]) {
+    let k = ds.k;
+    let cp = ds.centroids_i16.as_ptr();
+    for ci in 0..k {
+        let cbase = ci * DIMS;
+        let mut s: i32 = 0;
+        for d in 0..DIMS {
+            let diff = (qi[d] as i32) - (*cp.add(cbase + d) as i32);
+            s = s.saturating_add(diff * diff);
+        }
+        out[ci] = s;
+    }
 }
 
 #[inline]
@@ -293,6 +305,70 @@ unsafe fn scan_buckets(qi: &[i16; 14], ds: &Dataset, probes: &[u32], heap: &mut 
             }
             j += 1;
         }
+    }
+}
+
+// Iterate buckets in increasing centroid-distance order and prune by
+// triangle inequality: any vector in bucket b has dist(q, v) >=
+// sqrt(cdist[b]) - radius[b], so once that lower bound exceeds the
+// current 5th-nearest distance the bucket cannot contribute and is
+// skipped. Buckets with non-zero radius give exact results; v1 indices
+// (radius=0) degrade to a full scan in cdist order — still correct,
+// just slower.
+#[target_feature(enable = "avx2,fma")]
+unsafe fn scan_buckets_pruned(
+    qi: &[i16; 14],
+    cdists_i32: &[i32; MAX_CENTROIDS],
+    ds: &Dataset,
+    heap: &mut Heap5,
+) {
+    let k = ds.k;
+    let radius = ds.bucket_radius.as_ptr();
+
+    // (sqrt(cdist²), bucket_idx) pairs, sorted by cdist asc.
+    let mut order: [(f32, u32); MAX_CENTROIDS] = [(0.0, 0); MAX_CENTROIDS];
+    for ci in 0..k {
+        order[ci] = ((cdists_i32[ci] as f32).sqrt(), ci as u32);
+    }
+    let order_slice = &mut order[..k];
+    order_slice.sort_unstable_by(|a, b| {
+        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for &(cdist_sqrt, bi) in order_slice.iter() {
+        let bidx = bi as usize;
+        let r = *radius.add(bidx);
+        if heap.size >= 5 {
+            let lb = cdist_sqrt - r;
+            if lb > 0.0 && lb * lb > heap.worst() {
+                continue;
+            }
+        }
+        scan_one_bucket(qi, ds, bi, heap);
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+unsafe fn scan_one_bucket(qi: &[i16; 14], ds: &Dataset, ci: u32, heap: &mut Heap5) {
+    let vp = ds.bucket_vec.as_ptr();
+    let lp = ds.bucket_label.as_ptr();
+    let op = ds.bucket_orig.as_ptr();
+
+    let start = ds.bucket_off[ci as usize] as usize;
+    let end = ds.bucket_off[ci as usize + 1] as usize;
+    let mut j = start;
+    while j < end {
+        let vbase = j * DIMS;
+        let mut s: i32 = 0;
+        for d in 0..DIMS {
+            let diff = (qi[d] as i32) - (*vp.add(vbase + d) as i32);
+            s += diff * diff;
+        }
+        let s_f = s as f32;
+        if s_f < heap.worst() || heap.size < 5 {
+            heap.try_insert(s_f, *op.add(j), *lp.add(j));
+        }
+        j += 1;
     }
 }
 

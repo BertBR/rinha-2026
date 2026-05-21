@@ -1,18 +1,19 @@
 // Loads the IVF index file at process start.
 //
 // File format (little-endian):
-//   magic        4 bytes  "RKNN"
-//   version      4 bytes  u32 = 1
-//   n            4 bytes  u32  number of vectors
-//   k            4 bytes  u32  number of centroids
-//   d            4 bytes  u32  dimensions (always 14)
-//   _reserved    12 bytes
-//   centroids    k * 14 * 4 bytes   f32 centroid coordinates (row-major,
-//                                   centroid 0 dim 0..13, centroid 1 dim 0..13, ...)
-//   bucket_off   (k + 1) * 4 bytes  u32 cumulative offsets into bucket_vec
-//   bucket_label n bytes            u8 labels (1 = fraud, 0 = legit), in bucket order
-//   bucket_orig  n * 4 bytes        u32 original index (for grader tie-break)
-//   bucket_vec   n * 14 * 2 bytes   i16 quantized vectors in bucket order
+//   magic         4 bytes  "RKNN"
+//   version       4 bytes  u32 = 2  (v1 omits bucket_radius)
+//   n             4 bytes  u32  number of vectors
+//   k             4 bytes  u32  number of centroids
+//   d             4 bytes  u32  dimensions (always 14)
+//   _reserved     12 bytes
+//   centroids     k * 14 * 4 bytes   f32 centroid coordinates (row-major)
+//   bucket_off    (k + 1) * 4 bytes  u32 cumulative offsets into bucket_vec
+//   bucket_radius k * 4 bytes        f32 max dist (in i16 quantized space)
+//                                    from centroid to any vec in bucket
+//   bucket_label  n bytes            u8 labels (1 = fraud, 0 = legit), in bucket order
+//   bucket_orig   n * 4 bytes        u32 original index (for grader tie-break)
+//   bucket_vec    n * 14 * 2 bytes   i16 quantized vectors in bucket order
 //
 // All numeric arrays are not gzipped at the file level (the gzipping is done
 // at the .gz wrapping level if present). The runtime path uses
@@ -29,8 +30,10 @@ pub const QUANT_SCALE: f32 = 10000.0;
 pub struct Dataset {
     pub n: usize,
     pub k: usize,
-    pub centroids: Vec<f32>,
+    pub centroids: Vec<f32>,       // raw f32 (kept for diagnostics)
+    pub centroids_i16: Vec<i16>,   // same centroids quantized to i16 for pruning
     pub bucket_off: Vec<u32>,
+    pub bucket_radius: Vec<f32>,   // v2: max sqrt(i16-dist²) per bucket
     pub bucket_label: Vec<u8>,
     pub bucket_orig: Vec<u32>,
     pub bucket_vec: Vec<i16>,
@@ -62,7 +65,7 @@ fn load_embedded() -> std::io::Result<Dataset> {
         ));
     }
     let version = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-    if version != 1 {
+    if version != 1 && version != 2 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "unsupported version",
@@ -92,6 +95,15 @@ fn load_embedded() -> std::io::Result<Dataset> {
         ));
     }
 
+    // bucket_radius is only present in v2. For v1, leave zeros — pruning
+    // becomes a no-op then (lb = sqrt(cdist) - 0 = sqrt(cdist), which is
+    // never > heap.worst when the closest centroid is closest, so all
+    // buckets get scanned — equivalent to old behaviour).
+    let mut bucket_radius = vec![0f32; k];
+    if version >= 2 {
+        read_into_f32(&mut gz, &mut bucket_radius)?;
+    }
+
     let mut bucket_label = vec![0u8; n];
     gz.read_exact(&mut bucket_label)?;
 
@@ -101,10 +113,25 @@ fn load_embedded() -> std::io::Result<Dataset> {
     let mut bucket_vec = vec![0i16; n * DIMS];
     read_into_i16(&mut gz, &mut bucket_vec)?;
 
+    // Pre-quantize centroids to i16 once at init so the per-query
+    // pruning loop and the bucket scan agree on the distance metric.
+    let mut centroids_i16 = vec![0i16; k * DIMS];
+    for i in 0..(k * DIMS) {
+        let v = centroids[i];
+        centroids_i16[i] = if (v + 1.0).abs() < 1e-5 {
+            -32768
+        } else {
+            let qq = (v * QUANT_SCALE).round() as i32;
+            qq.clamp(-32768, 32767) as i16
+        };
+    }
+
     Ok(Dataset {
         n,
         k,
+        bucket_radius,
         centroids,
+        centroids_i16,
         bucket_off,
         bucket_label,
         bucket_orig,

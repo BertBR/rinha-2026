@@ -186,6 +186,12 @@ fn main() {
     let mut out_orig: Vec<u32> = vec![0u32; n];
     let mut out_vec: Vec<i16> = vec![0i16; n * DIMS];
 
+    // bucket_radius[ci] = max Euclidean distance from centroid ci to any
+    // vector assigned to it, computed in the SAME i16-quantized space the
+    // runtime kNN uses. That lets the runtime apply triangle-inequality
+    // pruning without needing to convert back to f32.
+    let mut bucket_radius_sq: Vec<u64> = vec![0u64; k];
+
     for i in 0..n {
         let c = assign[i] as usize;
         let pos = cursor[c] as usize;
@@ -194,6 +200,9 @@ fn main() {
         out_orig[pos] = i as u32;
         let vbase = i * DIMS;
         let obase = pos * DIMS;
+        // Centroid quantized to i16 for the radius computation.
+        let cbase = c * DIMS;
+        let mut dist_sq: u64 = 0;
         for d in 0..DIMS {
             let v = vectors[vbase + d];
             let qi = if (v + 1.0).abs() < 1e-5 {
@@ -203,17 +212,37 @@ fn main() {
                 qq.clamp(-32768, 32767) as i16
             };
             out_vec[obase + d] = qi;
+
+            // Quantize centroid on the fly (no need to store separately).
+            let cv = centroids[cbase + d];
+            let cqi = if (cv + 1.0).abs() < 1e-5 {
+                -32768i16
+            } else {
+                let cqq = (cv * QUANT_SCALE).round() as i32;
+                cqq.clamp(-32768, 32767) as i16
+            };
+            let diff = (qi as i64) - (cqi as i64);
+            dist_sq += (diff * diff) as u64;
+        }
+        if dist_sq > bucket_radius_sq[c] {
+            bucket_radius_sq[c] = dist_sq;
         }
     }
+
+    // Store sqrt as f32 (one per bucket, k * 4 bytes ≈ 8 KB for k=2048).
+    let bucket_radius: Vec<f32> = bucket_radius_sq
+        .iter()
+        .map(|&r2| (r2 as f64).sqrt() as f32)
+        .collect();
 
     // 6. Write index file.
     println!("[build-ivf] writing {output}");
     let file = File::create(output).expect("create output");
     let mut writer = BufWriter::new(GzEncoder::new(file, Compression::default()));
 
-    // Header
+    // Header (version 2 adds bucket_radius after bucket_off)
     writer.write_all(b"RKNN").unwrap();
-    writer.write_all(&1u32.to_le_bytes()).unwrap(); // version
+    writer.write_all(&2u32.to_le_bytes()).unwrap(); // version
     writer.write_all(&(n as u32).to_le_bytes()).unwrap();
     writer.write_all(&(k as u32).to_le_bytes()).unwrap();
     writer.write_all(&(DIMS as u32).to_le_bytes()).unwrap();
@@ -236,6 +265,16 @@ fn main() {
         )
     };
     writer.write_all(off_bytes).unwrap();
+
+    // Bucket radii (NEW in v2). One f32 per bucket, distance in i16-
+    // quantized space (matches the runtime distance metric).
+    let radii_bytes = unsafe {
+        std::slice::from_raw_parts(
+            bucket_radius.as_ptr() as *const u8,
+            bucket_radius.len() * std::mem::size_of::<f32>(),
+        )
+    };
+    writer.write_all(radii_bytes).unwrap();
 
     // Labels
     writer.write_all(&out_label).unwrap();
