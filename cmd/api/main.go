@@ -16,6 +16,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BertBR/rinha-2026/internal/knn"
@@ -42,6 +43,12 @@ var statePool sync.Pool
 var (
 	normalization *vec.Normalization
 	mccRisk       vec.MccRiskMap
+
+	// ready flips to true once the native kNN index is loaded and warm.
+	// readyCh is closed at the same moment so the first /fraud-score
+	// request can wait synchronously without busy-spinning.
+	ready   atomic.Bool
+	readyCh = make(chan struct{})
 )
 
 func main() {
@@ -55,13 +62,11 @@ func main() {
 		return &reqState{ctx: vec.NewContext(normalization, mccRisk)}
 	}
 
-	log.Printf("[api] initializing native kNN")
-	t0 := time.Now()
-	knn.Init()
-	log.Printf("[api]   ready in %v", time.Since(t0).Round(time.Millisecond))
-
-	warmup()
-
+	// Open the UDS listener BEFORE the heavy native init so HAProxy's TCP
+	// healthcheck connects immediately. The Rust init (gunzip 42 MB embedded
+	// index + 500-query warmup) takes 5-15 s under the 0.42 CPU cgroup, and
+	// the rinha smoke test marks the stack DOWN if the LB has no upstream
+	// when k6 fires. Handler blocks on `readyCh` until init completes.
 	if err := os.RemoveAll(udsPath); err != nil && !os.IsNotExist(err) {
 		log.Fatalf("[api] cleanup uds: %v", err)
 	}
@@ -73,6 +78,15 @@ func main() {
 		log.Printf("[api] chmod uds: %v", err)
 	}
 
+	go func() {
+		log.Printf("[api] initializing native kNN")
+		t0 := time.Now()
+		knn.Init()
+		log.Printf("[api]   ready in %v", time.Since(t0).Round(time.Millisecond))
+		ready.Store(true)
+		close(readyCh)
+	}()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /ready", handleReady)
 	mux.HandleFunc("POST /fraud-score", handleFraudScore)
@@ -80,7 +94,7 @@ func main() {
 	srv := &http.Server{
 		Handler:      mux,
 		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 3 * time.Second,
+		WriteTimeout: 30 * time.Second, // generous so the first request can wait through init
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -117,25 +131,27 @@ func loadConfig(dir string) error {
 	return nil
 }
 
-func warmup() {
-	t := time.Now()
-	st := &reqState{ctx: vec.NewContext(normalization, mccRisk)}
-	seed := uint32(0x12345)
-	for i := 0; i < 2000; i++ {
-		for d := 0; d < 14; d++ {
-			seed = seed*1664525 + 1013904223
-			st.q[d] = float32(seed>>8) / float32(1<<24)
-		}
-		_ = knn.FraudCount(&st.q)
-	}
-	log.Printf("[api]   warmup done in %v", time.Since(t).Round(time.Millisecond))
-}
-
 func handleReady(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusOK)
+	if ready.Load() {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
 }
 
 func handleFraudScore(w http.ResponseWriter, r *http.Request) {
+	// First request(s) arriving during native init wait for it to finish.
+	// k6's per-request timeout is 10 s, init is typically 5-15 s on the
+	// throttled container, so the first call may be slow but every subsequent
+	// one is fast.
+	if !ready.Load() {
+		select {
+		case <-readyCh:
+		case <-r.Context().Done():
+			return
+		}
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
