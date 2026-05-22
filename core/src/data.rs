@@ -34,6 +34,7 @@ pub struct Dataset {
     pub centroids_i16: Vec<i16>,   // same centroids quantized to i16 for pruning
     pub bucket_off: Vec<u32>,
     pub bucket_radius: Vec<f32>,   // v2: max sqrt(i16-dist²) per bucket
+    pub max_radius: f32,           // max(bucket_radius) for global pruning
     pub bucket_label: Vec<u8>,
     pub bucket_orig: Vec<u32>,
     pub bucket_vec: Vec<i16>,
@@ -115,21 +116,29 @@ fn load_embedded() -> std::io::Result<Dataset> {
 
     // Pre-quantize centroids to i16 once at init so the per-query
     // pruning loop and the bucket scan agree on the distance metric.
-    let mut centroids_i16 = vec![0i16; k * DIMS];
-    for i in 0..(k * DIMS) {
-        let v = centroids[i];
-        centroids_i16[i] = if (v + 1.0).abs() < 1e-5 {
-            -32768
-        } else {
-            let qq = (v * QUANT_SCALE).round() as i32;
-            qq.clamp(-32768, 32767) as i16
-        };
+    // Pad each centroid from 14 → 16 lanes so the AVX2 distance kernel
+    // can do a single 256-bit loadu + madd_epi16. Dims 14,15 stay zero;
+    // since the query is also zero-padded, those lanes contribute 0.
+    let mut centroids_i16 = vec![0i16; k * 16];
+    for ci in 0..k {
+        for d in 0..DIMS {
+            let v = centroids[ci * DIMS + d];
+            centroids_i16[ci * 16 + d] = if (v + 1.0).abs() < 1e-5 {
+                -32768
+            } else {
+                let qq = (v * QUANT_SCALE).round() as i32;
+                qq.clamp(-32768, 32767) as i16
+            };
+        }
     }
+
+    let max_radius = bucket_radius.iter().cloned().fold(0f32, f32::max);
 
     Ok(Dataset {
         n,
         k,
         bucket_radius,
+        max_radius,
         centroids,
         centroids_i16,
         bucket_off,

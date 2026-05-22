@@ -15,7 +15,7 @@ use crate::data::{dataset, Dataset, DIMS, QUANT_SCALE};
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
-const MAX_CENTROIDS: usize = 8192;
+const MAX_CENTROIDS: usize = 2048;
 
 pub fn query(q: &[f32; 14], ds: &Dataset) -> u8 {
     unsafe { query_avx2(q, ds) }
@@ -23,37 +23,37 @@ pub fn query(q: &[f32; 14], ds: &Dataset) -> u8 {
 
 #[target_feature(enable = "avx2,fma")]
 unsafe fn query_avx2(q: &[f32; 14], ds: &Dataset) -> u8 {
-    let mut qi = [0i16; 14];
-    quantize_query(q, &mut qi);
+    // Quantize query into a 16-lane padded buffer so the AVX2 distance
+    // kernel can loadu a full __m256i. Last two lanes stay zero — they
+    // match the same zero padding in centroids_i16, so they contribute 0.
+    let mut qi_pad = [0i16; 16];
+    quantize_query(q, &mut qi_pad);
 
     // Compute centroid distances in i16-quantized space so the triangle
     // inequality bound matches the per-bucket scan metric exactly.
     let mut cdists_i32 = [0i32; MAX_CENTROIDS];
-    centroid_distances_i16(&qi, ds, &mut cdists_i32);
+    centroid_distances_i16(&qi_pad, ds, &mut cdists_i32);
 
-    // Exact kNN via bbox-pruned bucket scan: iterate buckets in increasing
-    // centroid-distance order; prune any whose lower bound (triangle
-    // inequality: dist(q, v) >= dist(q, c) - radius(b)) already exceeds
-    // the heap's current 5th-nearest. ~5-10% of buckets scanned per
-    // query, exact result, eliminates the count==0/5 holes conditional
-    // escalation couldn't catch.
+    // qi without padding for downstream scan (still scalar).
+    let mut qi = [0i16; 14];
+    qi.copy_from_slice(&qi_pad[..14]);
+
     let mut heap = Heap5::new();
     scan_buckets_pruned(&qi, &cdists_i32, ds, &mut heap);
     heap.count_frauds()
 }
 
-// i16-space centroid distance: sum of squared diffs between qi and each
-// centroid's i16 quantization. Stored as i32 to avoid overflow
-// (max single diff ~65535, max sum-of-squares for 14 dims fits).
+// i16-space centroid distance (scalar fallback while bisecting bugs).
+// Padded layout: centroids_i16 is k*16 with dims 14,15 zero.
 #[target_feature(enable = "avx2,fma")]
-unsafe fn centroid_distances_i16(qi: &[i16; 14], ds: &Dataset, out: &mut [i32; MAX_CENTROIDS]) {
+unsafe fn centroid_distances_i16(qi_pad: &[i16; 16], ds: &Dataset, out: &mut [i32; MAX_CENTROIDS]) {
     let k = ds.k;
     let cp = ds.centroids_i16.as_ptr();
     for ci in 0..k {
-        let cbase = ci * DIMS;
+        let cbase = ci * 16;
         let mut s: i32 = 0;
         for d in 0..DIMS {
-            let diff = (qi[d] as i32) - (*cp.add(cbase + d) as i32);
+            let diff = (qi_pad[d] as i32) - (*cp.add(cbase + d) as i32);
             s = s.saturating_add(diff * diff);
         }
         out[ci] = s;
@@ -61,7 +61,7 @@ unsafe fn centroid_distances_i16(qi: &[i16; 14], ds: &Dataset, out: &mut [i32; M
 }
 
 #[inline]
-fn quantize_query(q: &[f32; 14], out: &mut [i16; 14]) {
+fn quantize_query(q: &[f32; 14], out: &mut [i16; 16]) {
     for d in 0..DIMS {
         let v = q[d];
         if (v + 1.0).abs() < 1e-5 {
@@ -71,6 +71,9 @@ fn quantize_query(q: &[f32; 14], out: &mut [i16; 14]) {
             out[d] = qq.clamp(-32768, 32767) as i16;
         }
     }
+    // out[14], out[15] stay zero — match centroid padding.
+    out[14] = 0;
+    out[15] = 0;
 }
 
 #[target_feature(enable = "avx2,fma")]
@@ -313,8 +316,14 @@ unsafe fn scan_buckets(qi: &[i16; 14], ds: &Dataset, probes: &[u32], heap: &mut 
 // sqrt(cdist[b]) - radius[b], so once that lower bound exceeds the
 // current 5th-nearest distance the bucket cannot contribute and is
 // skipped. Buckets with non-zero radius give exact results; v1 indices
-// (radius=0) degrade to a full scan in cdist order — still correct,
-// just slower.
+// (radius=0) degrade to a full scan in cdist order — still correct.
+//
+// Perf optimizations vs go-r11:
+//   1. Sort u32 indices by i32 cdist (single int cmp vs f32 partial_cmp).
+//   2. Global early-exit when the closest remaining bucket cannot beat
+//      the heap worst even at max_radius — terminate without continuing
+//      to pop sorted entries.
+//   3. Only compute .sqrt() inside the inner loop (avoids 2048 sqrts).
 #[target_feature(enable = "avx2,fma")]
 unsafe fn scan_buckets_pruned(
     qi: &[i16; 14],
@@ -324,23 +333,36 @@ unsafe fn scan_buckets_pruned(
 ) {
     let k = ds.k;
     let radius = ds.bucket_radius.as_ptr();
+    let max_r = ds.max_radius;
 
-    // (sqrt(cdist²), bucket_idx) pairs, sorted by cdist asc.
-    let mut order: [(f32, u32); MAX_CENTROIDS] = [(0.0, 0); MAX_CENTROIDS];
-    for ci in 0..k {
-        order[ci] = ((cdists_i32[ci] as f32).sqrt(), ci as u32);
+    // Indices sorted by cdists_i32 asc. i32 key — sort is fast.
+    let mut idx: [u32; MAX_CENTROIDS] = [0u32; MAX_CENTROIDS];
+    for i in 0..k {
+        idx[i] = i as u32;
     }
-    let order_slice = &mut order[..k];
-    order_slice.sort_unstable_by(|a, b| {
-        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let idx_slice = &mut idx[..k];
+    idx_slice.sort_unstable_by_key(|&i| cdists_i32[i as usize]);
 
-    for &(cdist_sqrt, bi) in order_slice.iter() {
+    for &bi in idx_slice.iter() {
         let bidx = bi as usize;
-        let r = *radius.add(bidx);
+        let cd = cdists_i32[bidx] as f32;
+        let cd_sqrt = cd.sqrt();
+
         if heap.size >= 5 {
-            let lb = cdist_sqrt - r;
-            if lb > 0.0 && lb * lb > heap.worst() {
+            let worst = heap.worst();
+            // Global termination: if even the closest possible vector in
+            // ANY remaining bucket (cdist asc, radius bounded by max_r)
+            // can't beat worst, stop. All subsequent buckets have cdist
+            // >= this one's cdist, so lb_global is monotonically
+            // non-decreasing.
+            let lb_global = cd_sqrt - max_r;
+            if lb_global > 0.0 && lb_global * lb_global > worst {
+                break;
+            }
+            // Per-bucket prune: this bucket specifically can't help.
+            let r = *radius.add(bidx);
+            let lb = cd_sqrt - r;
+            if lb > 0.0 && lb * lb > worst {
                 continue;
             }
         }
