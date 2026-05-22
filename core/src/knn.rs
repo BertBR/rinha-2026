@@ -16,26 +16,46 @@ use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
 const MAX_CENTROIDS: usize = 2048;
+const FAST_NPROBE: usize = 12;
+const FULL_NPROBE: usize = 64;
 
 pub fn query(q: &[f32; 14], ds: &Dataset) -> u8 {
     unsafe { query_avx2(q, ds) }
 }
 
+// Restored from go-r6 (5121 score baseline): two-pass NPROBE escalation
+// is much faster than bbox-pruned exact kNN under throttled CPU, and the
+// 3 detection errors it produces cost far less than the latency of
+// scanning hundreds of buckets. Now combined with the AVX2 scan kernel
+// from go-r13, every bucket scan is ~6 instructions per vec instead of
+// 14 scalar mul-adds — so the FULL pass over 64 buckets should be well
+// under r6's already-fast 3.5ms p99.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn query_avx2(q: &[f32; 14], ds: &Dataset) -> u8 {
-    // Quantize query into a 16-lane padded buffer so the AVX2 distance
-    // kernel can loadu a full __m256i. Last two lanes stay zero — they
-    // match the same zero padding in centroids_i16, so they contribute 0.
+    // 16-lane padded query so scan_buckets can do a single 256-bit loadu
+    // per vec. Dims 14,15 stay zero — match centroid/bucket zero padding.
     let mut qi_pad = [0i16; 16];
     quantize_query(q, &mut qi_pad);
 
-    // Compute centroid distances in i16-quantized space so the triangle
-    // inequality bound matches the per-bucket scan metric exactly.
-    let mut cdists_i32 = [0i32; MAX_CENTROIDS];
-    centroid_distances_i16(&qi_pad, ds, &mut cdists_i32);
+    // Centroid distances stay in f32 (AVX2 path below). The escalate
+    // decision is purely on heap fraud count — no triangle-inequality
+    // pruning to fall apart under outlier queries.
+    let mut cdists = [MaybeUninit::<f32>::uninit(); MAX_CENTROIDS];
+    centroid_distances(q, ds, &mut cdists);
 
+    let fast = top_k_indices::<FAST_NPROBE>(&cdists, ds.k);
     let mut heap = Heap5::new();
-    scan_buckets_pruned(&qi_pad, &cdists_i32, ds, &mut heap);
+    scan_buckets(&qi_pad, ds, &fast, &mut heap);
+    let fast_count = heap.count_frauds();
+
+    if fast_count != 2 && fast_count != 3 {
+        return fast_count;
+    }
+
+    // Decision-boundary cases: re-scan with FULL_NPROBE for accuracy.
+    let full = top_k_indices::<FULL_NPROBE>(&cdists, ds.k);
+    let mut heap = Heap5::new();
+    scan_buckets(&qi_pad, ds, &full, &mut heap);
     heap.count_frauds()
 }
 
@@ -274,30 +294,36 @@ impl Heap5 {
     }
 }
 
+// AVX2 batch scan over a set of probe buckets. Per-vec cost: load query
+// once outside the loop, then load vec / sub_epi16 / madd_epi16 / hsum.
+// Padded n*16 bucket_vec layout required (see data.rs).
 #[target_feature(enable = "avx2,fma")]
-unsafe fn scan_buckets(qi: &[i16; 14], ds: &Dataset, probes: &[u32], heap: &mut Heap5) {
+unsafe fn scan_buckets(qi_pad: &[i16; 16], ds: &Dataset, probes: &[u32], heap: &mut Heap5) {
     let vp = ds.bucket_vec.as_ptr();
     let lp = ds.bucket_label.as_ptr();
     let op = ds.bucket_orig.as_ptr();
+    let qv = _mm256_loadu_si256(qi_pad.as_ptr() as *const __m256i);
 
     for &ci in probes.iter() {
         let start = ds.bucket_off[ci as usize] as usize;
         let end = ds.bucket_off[ci as usize + 1] as usize;
 
         let mut j = start;
-        // Scalar loop for now. The body is small (14 dims), V8 unrolls similar
-        // logic to vectorize-friendly code, but here we're already in Rust.
-        // A real SIMD batch would process 8 vectors at once after lane permute;
-        // for now correctness first.
         while j < end {
-            let vbase = j * DIMS;
-            let mut s: i32 = 0;
-            for d in 0..DIMS {
-                let diff = (qi[d] as i32) - (*vp.add(vbase + d) as i32);
-                s += diff * diff;
-            }
-            // Early-out optimization: if current sum already exceeds worst,
-            // skip the heap update. But we still pay full compute.
+            let vv = _mm256_loadu_si256(vp.add(j * 16) as *const __m256i);
+            let diff = _mm256_sub_epi16(qv, vv);
+            let sq = _mm256_madd_epi16(diff, diff); // 8 i32 lanes
+
+            // Horizontal sum: 8 i32 → scalar i32 (matches scalar reference).
+            let hi128 = _mm256_extracti128_si256(sq, 1);
+            let lo128 = _mm256_castsi256_si128(sq);
+            let s4 = _mm_add_epi32(lo128, hi128);
+            let s4_shuf = _mm_shuffle_epi32(s4, 0b_01_00_11_10);
+            let s2 = _mm_add_epi32(s4, s4_shuf);
+            let s2_shuf = _mm_shuffle_epi32(s2, 0b_00_00_00_01);
+            let s1 = _mm_add_epi32(s2, s2_shuf);
+            let s = _mm_cvtsi128_si32(s1);
+
             let s_f = s as f32;
             if s_f < heap.worst() || heap.size < 5 {
                 heap.try_insert(s_f, *op.add(j), *lp.add(j));
