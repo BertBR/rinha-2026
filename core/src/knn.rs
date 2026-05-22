@@ -294,15 +294,28 @@ impl Heap5 {
     }
 }
 
-// AVX2 batch scan over a set of probe buckets. Per-vec cost: load query
-// once outside the loop, then load vec / sub_epi16 / madd_epi16 / hsum.
-// Padded n*16 bucket_vec layout required (see data.rs).
+// AVX2 batch scan over probe buckets, but using TWO _mm_loadu_si128 per
+// vec instead of a single _mm256_loadu_si256. This keeps bucket_vec in
+// n*14 layout (saves 12MB vs padded n*16) — critical, because go-r15
+// with n*16 hit the 160MB container memory limit, causing OOM-kill +
+// restart loops + 1464 http_errors on the bot.
+//
+// Per vec: load dims 0-7 + dims 8-15 (last 2 i16 are OOB/garbage on
+// most vecs), mask the high half to zero out lanes 6, 7 (= dims 14, 15),
+// madd_epi16, sum, horizontal-add to scalar. bucket_vec has 8 zero i16
+// tail pad (see data.rs) so the OOB load on the LAST vec is safe.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn scan_buckets(qi_pad: &[i16; 16], ds: &Dataset, probes: &[u32], heap: &mut Heap5) {
     let vp = ds.bucket_vec.as_ptr();
     let lp = ds.bucket_label.as_ptr();
     let op = ds.bucket_orig.as_ptr();
-    let qv = _mm256_loadu_si256(qi_pad.as_ptr() as *const __m256i);
+
+    // qi_pad already has dims 14, 15 zeroed → qv_hi has zeros at lanes
+    // 6, 7. We still mask cv_hi's diff because cv_hi's lanes 6, 7 are
+    // garbage (next vec's data or tail padding).
+    let qv_lo = _mm_loadu_si128(qi_pad.as_ptr() as *const __m128i);
+    let qv_hi = _mm_loadu_si128(qi_pad.as_ptr().add(8) as *const __m128i);
+    let tail_mask = _mm_setr_epi16(-1, -1, -1, -1, -1, -1, 0, 0);
 
     for &ci in probes.iter() {
         let start = ds.bucket_off[ci as usize] as usize;
@@ -310,18 +323,24 @@ unsafe fn scan_buckets(qi_pad: &[i16; 16], ds: &Dataset, probes: &[u32], heap: &
 
         let mut j = start;
         while j < end {
-            let vv = _mm256_loadu_si256(vp.add(j * 16) as *const __m256i);
-            let diff = _mm256_sub_epi16(qv, vv);
-            let sq = _mm256_madd_epi16(diff, diff); // 8 i32 lanes
+            let vbase = j * DIMS;
 
-            // Horizontal sum: 8 i32 → scalar i32 (matches scalar reference).
-            let hi128 = _mm256_extracti128_si256(sq, 1);
-            let lo128 = _mm256_castsi256_si128(sq);
-            let s4 = _mm_add_epi32(lo128, hi128);
-            let s4_shuf = _mm_shuffle_epi32(s4, 0b_01_00_11_10);
-            let s2 = _mm_add_epi32(s4, s4_shuf);
-            let s2_shuf = _mm_shuffle_epi32(s2, 0b_00_00_00_01);
-            let s1 = _mm_add_epi32(s2, s2_shuf);
+            let cv_lo = _mm_loadu_si128(vp.add(vbase) as *const __m128i);
+            let diff_lo = _mm_sub_epi16(qv_lo, cv_lo);
+            let sq_lo = _mm_madd_epi16(diff_lo, diff_lo); // 4 i32 lanes
+
+            let cv_hi = _mm_loadu_si128(vp.add(vbase + 8) as *const __m128i);
+            let diff_hi = _mm_sub_epi16(qv_hi, cv_hi);
+            let diff_hi_masked = _mm_and_si128(diff_hi, tail_mask);
+            let sq_hi = _mm_madd_epi16(diff_hi_masked, diff_hi_masked); // 4 i32 lanes
+
+            let sq = _mm_add_epi32(sq_lo, sq_hi); // 4 i32 lanes
+
+            // Horizontal sum of 4 i32 lanes → scalar i32.
+            let shuf = _mm_shuffle_epi32(sq, 0b_01_00_11_10);
+            let s2 = _mm_add_epi32(sq, shuf);
+            let shuf2 = _mm_shuffle_epi32(s2, 0b_00_00_00_01);
+            let s1 = _mm_add_epi32(s2, shuf2);
             let s = _mm_cvtsi128_si32(s1);
 
             let s_f = s as f32;

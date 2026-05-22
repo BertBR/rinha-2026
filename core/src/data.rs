@@ -111,37 +111,22 @@ fn load_embedded() -> std::io::Result<Dataset> {
     let mut bucket_orig = vec![0u32; n];
     read_into_u32(&mut gz, &mut bucket_orig)?;
 
-    // Read 14-dim vectors from the index, then re-pack into 16-lane padded
-    // layout so the AVX2 distance kernel can use a single 256-bit loadu +
-    // madd_epi16. Dims 14,15 stay zero — query is also zero-padded, so
-    // those lanes contribute 0 to the squared distance.
-    let mut raw_vec = vec![0i16; n * DIMS];
-    read_into_i16(&mut gz, &mut raw_vec)?;
-    let mut bucket_vec = vec![0i16; n * 16];
-    for j in 0..n {
-        for d in 0..DIMS {
-            bucket_vec[j * 16 + d] = raw_vec[j * DIMS + d];
-        }
+    // Read 14-dim vectors from the index. Allocate 8 extra zero i16 at the
+    // tail so the AVX2 scan kernel can _mm_loadu_si128(vp + vbase + 8) on
+    // the LAST vec without going OOB — that tail load reads 8 i16 starting
+    // at (n-1)*14 + 8, which goes 2 i16 past the real data. The pad makes
+    // it safe; the kernel masks those lanes off via tail_mask.
+    let mut bucket_vec = vec![0i16; n * DIMS + 8];
+    {
+        let body = &mut bucket_vec[..n * DIMS];
+        read_into_i16(&mut gz, body)?;
     }
-    drop(raw_vec);
 
-    // Pre-quantize centroids to i16 once at init so the per-query
-    // pruning loop and the bucket scan agree on the distance metric.
-    // Pad each centroid from 14 → 16 lanes so the AVX2 distance kernel
-    // can do a single 256-bit loadu + madd_epi16. Dims 14,15 stay zero;
-    // since the query is also zero-padded, those lanes contribute 0.
-    let mut centroids_i16 = vec![0i16; k * 16];
-    for ci in 0..k {
-        for d in 0..DIMS {
-            let v = centroids[ci * DIMS + d];
-            centroids_i16[ci * 16 + d] = if (v + 1.0).abs() < 1e-5 {
-                -32768
-            } else {
-                let qq = (v * QUANT_SCALE).round() as i32;
-                qq.clamp(-32768, 32767) as i16
-            };
-        }
-    }
+    // centroids_i16 was used by the bbox-prune kNN variant; the NPROBE
+    // escalate flow (r6/r16) uses the f32 centroid_distances kernel, so
+    // we keep this allocation tiny — just a length-zero stub to satisfy
+    // the Dataset struct shape. Saves ~64KB at runtime.
+    let centroids_i16: Vec<i16> = Vec::new();
 
     let max_radius = bucket_radius.iter().cloned().fold(0f32, f32::max);
 
