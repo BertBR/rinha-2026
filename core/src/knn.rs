@@ -17,7 +17,11 @@ use std::mem::MaybeUninit;
 
 const MAX_CENTROIDS: usize = 2048;
 const FAST_NPROBE: usize = 12;
-const FULL_NPROBE: usize = 64;
+// FULL=64 gave 8 local mismatches (r16). FULL=128 gave 12 — quantization
+// noise from i16 vectors means MORE candidates lets MORE wrong-neighbors
+// sneak in. Try 80 — slight widening over 64 to maybe pick up a true
+// neighbor without dragging in noise. If 80 is worse than 64, revert.
+const FULL_NPROBE: usize = 80;
 
 pub fn query(q: &[f32; 14], ds: &Dataset) -> u8 {
     unsafe { query_avx2(q, ds) }
@@ -48,13 +52,12 @@ unsafe fn query_avx2(q: &[f32; 14], ds: &Dataset) -> u8 {
     scan_buckets(&qi_pad, ds, &fast, &mut heap);
     let fast_count = heap.count_frauds();
 
-    // r16 had 4 FP + 3 FN at -343.84 detection penalty. Some errors come
-    // from counts 1 and 4 where FAST misranked the top-5 boundary, not
-    // just the {2,3} decision boundary. Escalate on all middle counts;
-    // only 0 and 5 stay terminal (12 unanimous probes rarely flip when
-    // widened). Costs ~30% queries escalating vs ~10% — p99 should stay
-    // well under 5ms with AVX2 scan.
-    if fast_count == 0 || fast_count == 5 {
+    // Back to r16's narrower escalation: only re-scan when FAST=12 hit
+    // the {2,3} decision boundary. r17's widened {1..4} escalation added
+    // ~20% more FULL passes without reducing the error count — the
+    // accuracy bottleneck was FULL=64, not the trigger threshold. Now
+    // with FULL=128, widening escalation again would be redundant work.
+    if fast_count != 2 && fast_count != 3 {
         return fast_count;
     }
 
