@@ -339,23 +339,29 @@ unsafe fn scan_buckets_pruned(
     let idx_slice = &mut idx[..k];
     idx_slice.sort_unstable_by_key(|&i| cdists_i32[i as usize]);
 
+    // Hard latency cap. go-r13's bot p99 was 777 ms — outlier queries
+    // were scanning ~all 2048 buckets when bbox pruning couldn't fire
+    // (heap.worst still large). Capping the actually-scanned count caps
+    // the worst-case per-query work. 128 covers >99% of queries that
+    // bbox-prune would have scanned; outliers degrade gracefully to a
+    // best-effort approximate result rather than blocking the queue.
+    let mut scanned: usize = 0;
+    const MAX_SCANNED: usize = 128;
+
     for &bi in idx_slice.iter() {
+        if scanned >= MAX_SCANNED {
+            break;
+        }
         let bidx = bi as usize;
         let cd = cdists_i32[bidx] as f32;
         let cd_sqrt = cd.sqrt();
 
         if heap.size >= 5 {
             let worst = heap.worst();
-            // Global termination: if even the closest possible vector in
-            // ANY remaining bucket (cdist asc, radius bounded by max_r)
-            // can't beat worst, stop. All subsequent buckets have cdist
-            // >= this one's cdist, so lb_global is monotonically
-            // non-decreasing.
             let lb_global = cd_sqrt - max_r;
             if lb_global > 0.0 && lb_global * lb_global > worst {
                 break;
             }
-            // Per-bucket prune: this bucket specifically can't help.
             let r = *radius.add(bidx);
             let lb = cd_sqrt - r;
             if lb > 0.0 && lb * lb > worst {
@@ -363,6 +369,7 @@ unsafe fn scan_buckets_pruned(
             }
         }
         scan_one_bucket(qi_pad, ds, bi, heap);
+        scanned += 1;
     }
 }
 
