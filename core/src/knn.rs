@@ -48,11 +48,16 @@ unsafe fn query_avx2(q: &[f32; 14], ds: &Dataset) -> u8 {
     scan_buckets(&qi_pad, ds, &fast, &mut heap);
     let fast_count = heap.count_frauds();
 
-    if fast_count != 2 && fast_count != 3 {
+    // r16 had 4 FP + 3 FN at -343.84 detection penalty. Some errors come
+    // from counts 1 and 4 where FAST misranked the top-5 boundary, not
+    // just the {2,3} decision boundary. Escalate on all middle counts;
+    // only 0 and 5 stay terminal (12 unanimous probes rarely flip when
+    // widened). Costs ~30% queries escalating vs ~10% — p99 should stay
+    // well under 5ms with AVX2 scan.
+    if fast_count == 0 || fast_count == 5 {
         return fast_count;
     }
 
-    // Decision-boundary cases: re-scan with FULL_NPROBE for accuracy.
     let full = top_k_indices::<FULL_NPROBE>(&cdists, ds.k);
     let mut heap = Heap5::new();
     scan_buckets(&qi_pad, ds, &full, &mut heap);
