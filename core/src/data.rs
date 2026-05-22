@@ -111,8 +111,19 @@ fn load_embedded() -> std::io::Result<Dataset> {
     let mut bucket_orig = vec![0u32; n];
     read_into_u32(&mut gz, &mut bucket_orig)?;
 
-    let mut bucket_vec = vec![0i16; n * DIMS];
-    read_into_i16(&mut gz, &mut bucket_vec)?;
+    // Read 14-dim vectors from the index, then re-pack into 16-lane padded
+    // layout so the AVX2 distance kernel can use a single 256-bit loadu +
+    // madd_epi16. Dims 14,15 stay zero — query is also zero-padded, so
+    // those lanes contribute 0 to the squared distance.
+    let mut raw_vec = vec![0i16; n * DIMS];
+    read_into_i16(&mut gz, &mut raw_vec)?;
+    let mut bucket_vec = vec![0i16; n * 16];
+    for j in 0..n {
+        for d in 0..DIMS {
+            bucket_vec[j * 16 + d] = raw_vec[j * DIMS + d];
+        }
+    }
+    drop(raw_vec);
 
     // Pre-quantize centroids to i16 once at init so the per-query
     // pruning loop and the bucket scan agree on the distance metric.
