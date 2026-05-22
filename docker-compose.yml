@@ -1,7 +1,7 @@
 name: rinha-2026
 
 x-api: &api-template
-  image: ghcr.io/bertbr/rinha-2026-api:go-r13
+  image: ghcr.io/bertbr/rinha-2026-api:go-r14
   pull_policy: always
   restart: unless-stopped
   volumes:
